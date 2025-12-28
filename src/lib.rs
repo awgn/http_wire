@@ -104,4 +104,29 @@ mod tests {
         assert!(output.contains("HTTP/1.1 404"));
         assert!(output.contains("Not Found"));
     }
+
+    #[tokio::test]
+    async fn test_http2_request_rejected() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/")
+            .version(http::Version::HTTP_2)
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let result = request.to_bytes().await;
+        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
+    }
+
+    #[tokio::test]
+    async fn test_http2_response_rejected() {
+        let response = Response::builder()
+            .status(200)
+            .version(http::Version::HTTP_2)
+            .body(Full::new(Bytes::from("Hello")))
+            .unwrap();
+
+        let result = response.to_bytes().await;
+        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
+    }
 }

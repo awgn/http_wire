@@ -19,6 +19,12 @@ where
     use hyper::service::service_fn;
     use std::convert::Infallible;
 
+    // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
+    let version = request.version();
+    if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
+        return Err(WireError::UnsupportedVersion);
+    }
+
     let (client, server) = duplex(8192);
     let capture_client = WireCapture::new(client);
     let captured_ref = capture_client.captured.clone();
@@ -73,7 +79,8 @@ where
     client_handle.abort();
     server_handle.abort();
 
-    Ok(captured_ref.lock().clone())
+    let result = captured_ref.lock().clone();
+    Ok(result)
 }
 
 #[cfg(test)]

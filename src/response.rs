@@ -19,6 +19,12 @@ where
 {
     use std::convert::Infallible;
 
+    // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
+    let version = response.version();
+    if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
+        return Err(WireError::UnsupportedVersion);
+    }
+
     let (client, server) = duplex(8192);
     let capture_server = WireCapture::new(server);
     let captured_ref = capture_server.captured.clone();
@@ -69,7 +75,8 @@ where
     rx.await.map_err(|_| WireError::Sync)??;
     let _ = handle.await;
 
-    Ok(captured_ref.lock().clone())
+    let result = captured_ref.lock().clone();
+    Ok(result)
 }
 
 #[cfg(test)]

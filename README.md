@@ -2,6 +2,8 @@
 
 A Rust library to serialize HTTP/1.1 requests and responses to their wire format (raw bytes).
 
+> **Note**: This crate only supports HTTP/1.1. HTTP/2 is not supported due to its binary framing, HPACK header compression, and multiplexed nature which make single request/response serialization impractical.
+
 ## Usage
 
 Add to your `Cargo.toml`:
@@ -51,6 +53,28 @@ async fn example() {
     // bytes contains the full HTTP/1.1 response
 }
 ```
+
+### Error handling
+
+```rust
+use http_wire::{ToWire, WireError};
+
+async fn example() -> Result<(), WireError> {
+    let request = http::Request::builder()
+        .uri("/")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+
+    let bytes = request.to_bytes().await?;
+    println!("Serialized {} bytes", bytes.len());
+    Ok(())
+}
+```
+
+`WireError` has three variants:
+- `Connection` - HTTP connection error (handshake or send failed)
+- `Sync` - Internal synchronization error
+- `UnsupportedVersion` - HTTP version not supported (only HTTP/1.0 and HTTP/1.1 are supported)
 
 ## License
 

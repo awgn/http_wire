@@ -8,4 +8,8 @@ pub enum WireError {
     /// Synchronization error (internal channel closed unexpectedly)
     #[error("synchronization error: channel closed unexpectedly")]
     Sync,
+
+    /// Unsupported HTTP version (only HTTP/1.1 is supported)
+    #[error("unsupported HTTP version: only HTTP/1.1 is supported")]
+    UnsupportedVersion,
 }
