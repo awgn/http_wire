@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Empty;
@@ -8,19 +6,24 @@ use hyper_util::rt::TokioIo;
 use tokio::io::duplex;
 use tokio::sync::oneshot;
 
+use crate::error::WireError;
 use crate::wire::WireCapture;
 
-pub async fn to_bytes<B: Body + Clone>(response: Response<B>) -> Vec<u8>
+/// Serialize an HTTP response to raw bytes using hyper's HTTP/1.1 serialization.
+/// This uses a duplex stream to capture the exact bytes that would be sent over the wire.
+pub async fn to_bytes<B>(response: Response<B>) -> Result<Vec<u8>, WireError>
 where
     B: Body + Clone + Send + Sync + 'static,
     <B as Body>::Error: std::error::Error + Send + Sync + 'static,
     <B as Body>::Data: Send + Sync + 'static,
 {
+    use std::convert::Infallible;
+
     let (client, server) = duplex(8192);
     let capture_server = WireCapture::new(server);
     let captured_ref = capture_server.captured.clone();
 
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel::<Result<(), WireError>>();
 
     let handle = tokio::spawn(async move {
         let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
@@ -28,9 +31,9 @@ where
             async move { Ok::<_, Infallible>(res) }
         });
 
-        let _ = hyper::server::conn::http1::Builder::new()
+        hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(capture_server), service)
-            .await;
+            .await
     });
 
     let req = hyper::Request::builder()
@@ -45,20 +48,29 @@ where
             .handshake(TokioIo::new(client))
             .await;
 
-        if let Ok((mut sender, connection)) = client_connection {
-            tokio::spawn(connection);
-            // When send_request completes, the response has been received
-            let _ = sender.send_request(req).await;
-            let _ = tx.send(()); // Signal completion
+        match client_connection {
+            Ok((mut sender, connection)) => {
+                tokio::spawn(connection);
+                // When send_request completes, the response has been received
+                let result = sender
+                    .send_request(req)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| WireError::Connection(Box::new(e)));
+                let _ = tx.send(result);
+            }
+            Err(e) => {
+                let _ = tx.send(Err(WireError::Connection(Box::new(e))));
+            }
         }
     });
 
-    // Wait for completion instead of sleep
-    let _ = rx.await;
+    // Wait for completion
+    rx.await.map_err(|_| WireError::Sync)??;
     let _ = handle.await;
-    captured_ref.lock().clone()
-}
 
+    Ok(captured_ref.lock().clone())
+}
 
 #[cfg(test)]
 mod tests {
@@ -73,7 +85,7 @@ mod tests {
             .body(Full::new(Bytes::from("Hello World")))
             .unwrap();
 
-        let bytes = to_bytes(response).await;
+        let bytes = to_bytes(response).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 Response:\n{}", output);
@@ -90,7 +102,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = to_bytes(response).await;
+        let bytes = to_bytes(response).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         // Verify the response has proper HTTP structure

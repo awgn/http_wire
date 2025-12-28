@@ -1,5 +1,3 @@
-use std::convert::Infallible;
-
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Empty;
@@ -7,23 +5,25 @@ use hyper_util::rt::TokioIo;
 use tokio::io::duplex;
 use tokio::sync::oneshot;
 
+use crate::error::WireError;
 use crate::wire::WireCapture;
 
-// Serialize an HTTP request to raw bytes using hyper's HTTP/1.1 serialization.
+/// Serialize an HTTP request to raw bytes using hyper's HTTP/1.1 serialization.
 /// This uses a duplex stream to capture the exact bytes that would be sent over the wire.
-pub async fn to_bytes<B>(request: Request<B>) -> Vec<u8>
+pub async fn to_bytes<B>(request: Request<B>) -> Result<Vec<u8>, WireError>
 where
     B: http_body_util::BodyExt + Send + 'static,
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     use hyper::service::service_fn;
+    use std::convert::Infallible;
 
     let (client, server) = duplex(8192);
     let capture_client = WireCapture::new(client);
     let captured_ref = capture_client.captured.clone();
 
-    let (tx, rx) = oneshot::channel::<()>();
+    let (tx, rx) = oneshot::channel::<Result<(), WireError>>();
 
     // Spawn a mock server that will accept the connection and read the request
     let server_handle = tokio::spawn(async move {
@@ -31,7 +31,7 @@ where
         let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
             // Signal that the request has been received
             if let Some(tx) = tx.lock().unwrap().take() {
-                let _ = tx.send(());
+                let _ = tx.send(Ok(()));
             }
             async move {
                 // Return a minimal response
@@ -39,9 +39,9 @@ where
             }
         });
 
-        let _ = hyper::server::conn::http1::Builder::new()
+        hyper::server::conn::http1::Builder::new()
             .serve_connection(TokioIo::new(server), service)
-            .await;
+            .await
     });
 
     // Send the request through the client side and capture what's written
@@ -50,23 +50,30 @@ where
             .handshake(TokioIo::new(capture_client))
             .await;
 
-        if let Ok((mut sender, connection)) = client_connection {
-            // Spawn the connection driver
-            tokio::spawn(connection);
+        match client_connection {
+            Ok((mut sender, connection)) => {
+                // Spawn the connection driver
+                tokio::spawn(connection);
 
-            // Send the request
-            let _ = sender.send_request(request).await;
+                // Send the request
+                sender
+                    .send_request(request)
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| WireError::Connection(Box::new(e)))
+            }
+            Err(e) => Err(WireError::Connection(Box::new(e))),
         }
     });
 
-    // Wait for the server to receive the request (instead of sleeping)
-    let _ = rx.await;
+    // Wait for the server to receive the request
+    rx.await.map_err(|_| WireError::Sync)??;
 
     // Cleanup
     client_handle.abort();
     server_handle.abort();
 
-    captured_ref.lock().clone()
+    Ok(captured_ref.lock().clone())
 }
 
 #[cfg(test)]
@@ -84,7 +91,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 Request:\n{}", output);
@@ -104,7 +111,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 POST Request:\n{}", output);
@@ -127,7 +134,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 Request with multiple headers:\n{}", output);
@@ -149,7 +156,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 PUT Request:\n{}", output);
@@ -166,7 +173,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 DELETE Request:\n{}", output);
@@ -185,7 +192,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = to_bytes(request).await;
+        let bytes = to_bytes(request).await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         // Verify the request has proper HTTP structure

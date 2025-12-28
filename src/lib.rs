@@ -1,13 +1,15 @@
 use bytes::Bytes;
 use std::future::Future;
 
+mod error;
 pub mod request;
 pub mod response;
 mod wire;
 
+pub use error::WireError;
+
 pub trait ToWire {
-    type Error;
-    fn to_bytes(self) -> impl Future<Output = Result<Bytes, Self::Error>> + Send;
+    fn to_bytes(self) -> impl Future<Output = Result<Bytes, WireError>> + Send;
 }
 
 impl<B> ToWire for http::Request<B>
@@ -16,10 +18,8 @@ where
     B::Data: Send,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    type Error = std::convert::Infallible;
-
-    async fn to_bytes(self) -> Result<Bytes, Self::Error> {
-        let bytes = request::to_bytes(self).await;
+    async fn to_bytes(self) -> Result<Bytes, WireError> {
+        let bytes = request::to_bytes(self).await?;
         Ok(Bytes::from(bytes))
     }
 }
@@ -30,10 +30,8 @@ where
     B::Error: std::error::Error + Send + Sync + 'static,
     B::Data: Send + Sync + 'static,
 {
-    type Error = std::convert::Infallible;
-
-    async fn to_bytes(self) -> Result<Bytes, Self::Error> {
-        let bytes = response::to_bytes(self).await;
+    async fn to_bytes(self) -> Result<Bytes, WireError> {
+        let bytes = response::to_bytes(self).await?;
         Ok(Bytes::from(bytes))
     }
 }
