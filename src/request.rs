@@ -5,6 +5,7 @@ use http::{Request, Response};
 use http_body_util::Empty;
 use hyper_util::rt::TokioIo;
 use tokio::io::duplex;
+use tokio::sync::oneshot;
 
 use crate::wire::WireCapture;
 
@@ -22,11 +23,20 @@ where
     let capture_client = WireCapture::new(client);
     let captured_ref = capture_client.captured.clone();
 
+    let (tx, rx) = oneshot::channel::<()>();
+
     // Spawn a mock server that will accept the connection and read the request
     let server_handle = tokio::spawn(async move {
-        let service = service_fn(move |_req: Request<hyper::body::Incoming>| async move {
-            // Return a minimal response
-            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        let tx = std::sync::Mutex::new(Some(tx));
+        let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+            // Signal that the request has been received
+            if let Some(tx) = tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            async move {
+                // Return a minimal response
+                Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+            }
         });
 
         let _ = hyper::server::conn::http1::Builder::new()
@@ -49,8 +59,8 @@ where
         }
     });
 
-    // Wait for the client to send the request
-    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+    // Wait for the server to receive the request (instead of sleeping)
+    let _ = rx.await;
 
     // Cleanup
     client_handle.abort();

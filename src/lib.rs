@@ -4,8 +4,12 @@ pub mod request;
 pub mod response;
 pub mod wire;
 
+use core::future::Future;
+
 pub trait Wire {
-    fn to_bytes(&self) -> Bytes;
+    type Error;
+    type Future: Future<Output = Result<Bytes, Self::Error>>;
+    fn to_bytes(&self) -> Self::Future;
 }
 
 #[cfg(test)]

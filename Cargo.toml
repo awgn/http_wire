@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 bytes = "1.11.0"
+futures = "0.3.31"
 http = "1.4.0"
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
