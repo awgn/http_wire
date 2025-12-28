@@ -5,13 +5,8 @@ use std::{
     task::{Context, Poll},
 };
 
-use bytes::Bytes;
 use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite};
-
-pub trait Wire {
-    fn to_bytes(&self) -> Bytes;
-}
 
 /// Socket wrapper that captures written bytes while simulating a real connection
 pub(crate) struct WireCapture {

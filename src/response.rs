@@ -58,3 +58,48 @@ where
     let _ = handle.await;
     captured_ref.lock().clone()
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http_body_util::Full;
+
+    #[tokio::test]
+    async fn test_http1_capture() {
+        let response = Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain")
+            .body(Full::new(Bytes::from("Hello World")))
+            .unwrap();
+
+        let bytes = to_bytes(response).await;
+        let output = String::from_utf8_lossy(&bytes);
+
+        println!("HTTP/1.1 Response:\n{}", output);
+        assert!(output.contains("HTTP/1.1 200 OK"));
+        assert!(output.contains("Hello World"));
+    }
+
+    #[tokio::test]
+    async fn test_response_is_complete() {
+        let body = "Hello World";
+        let response = Response::builder()
+            .status(200)
+            .header("Content-Type", "text/plain")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+
+        let bytes = to_bytes(response).await;
+        let output = String::from_utf8_lossy(&bytes);
+
+        // Verify the response has proper HTTP structure
+        assert!(output.contains("HTTP/1.1 200 OK"));
+        // Headers and body are separated by \r\n\r\n
+        assert!(output.contains("\r\n\r\n"), "Response should have header/body separator");
+        // Body should be present after the separator
+        let parts: Vec<&str> = output.splitn(2, "\r\n\r\n").collect();
+        assert_eq!(parts.len(), 2, "Response should have headers and body");
+        assert!(parts[1].contains(body), "Body should contain the payload");
+    }
+}
