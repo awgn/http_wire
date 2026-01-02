@@ -6,15 +6,73 @@ use tokio::io::duplex;
 use tokio::sync::oneshot;
 
 use crate::error::WireError;
+use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
 use crate::wire::WireCapture;
+use crate::{DummyRequest, WireDecode, WireEncode};
+
+impl<B> WireEncode for http::Request<B>
+where
+    B: http_body_util::BodyExt + Send + Sync + 'static,
+    B::Error: std::error::Error + Send + Sync + 'static,
+    B::Data: Send + Sync + 'static,
+{
+    #[inline]
+    async fn encode(self) -> Result<Bytes, WireError> {
+        let bytes = to_bytes(self).await?;
+        Ok(Bytes::from(bytes))
+    }
+}
+
+impl WireDecode for DummyRequest {
+    type Output = usize;
+
+    fn decode(buf: &[u8]) -> Option<Self::Output> {
+        // Keep headers on stack.
+        let mut headers = [httparse::EMPTY_HEADER; 32];
+        let mut req = httparse::Request::new(&mut headers);
+
+        match req.parse(buf) {
+            Ok(httparse::Status::Complete(headers_len)) => {
+                let mut content_len: Option<usize> = None;
+                let mut is_chunked = false;
+
+                // Scan headers for Content-Length and Transfer-Encoding
+                for header in req.headers.iter() {
+                    let name = header.name.as_bytes();
+                    if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
+                        content_len = parse_usize(header.value);
+                    } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
+                        is_chunked = is_chunked_slice(header.value);
+                    }
+                }
+
+                // Calculate body length
+                if is_chunked {
+                    let body_len = parse_chunked_body(&buf[headers_len..])?;
+                    Some(headers_len + body_len)
+                } else {
+                    // If content-length is missing, length is 0
+                    let len = content_len.unwrap_or(0);
+                    let total = headers_len + len;
+                    if buf.len() >= total {
+                        Some(total)
+                    } else {
+                        None
+                    }
+                }
+            }
+            _ => None,
+        }
+    }
+}
 
 /// Serialize an HTTP request to raw bytes using hyper's HTTP/1.1 serialization.
 /// This uses a duplex stream to capture the exact bytes that would be sent over the wire.
-pub async fn to_bytes<B>(request: Request<B>) -> Result<Vec<u8>, WireError>
+async fn to_bytes<B>(request: Request<B>) -> Result<Vec<u8>, WireError>
 where
     B: http_body_util::BodyExt + Send + 'static,
     B::Data: Send,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    B::Error: std::error::Error + Send + Sync + 'static,
 {
     use hyper::service::service_fn;
     use std::convert::Infallible;
@@ -205,10 +263,132 @@ mod tests {
         // Verify the request has proper HTTP structure
         assert!(output.contains("POST /api/data HTTP/1.1"));
         // Headers and body are separated by \r\n\r\n
-        assert!(output.contains("\r\n\r\n"), "Request should have header/body separator");
+        assert!(
+            output.contains("\r\n\r\n"),
+            "Request should have header/body separator"
+        );
         // Body should be present after the separator
         let parts: Vec<&str> = output.splitn(2, "\r\n\r\n").collect();
         assert_eq!(parts.len(), 2, "Request should have headers and body");
-        assert!(parts[1].contains(body), "Body should contain the JSON payload");
+        assert!(
+            parts[1].contains(body),
+            "Body should contain the JSON payload"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_request_to_wire() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/test")
+            .header("Host", "example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let bytes = request.encode().await.unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(output.contains("GET /api/test HTTP/1.1"));
+        assert!(output.contains("host: example.com"));
+    }
+
+    #[tokio::test]
+    async fn test_request_with_body_to_wire() {
+        let body = r#"{"test":"data"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/api/submit")
+            .header("Host", "example.com")
+            .header("Content-Type", "application/json")
+            .body(Full::new(Bytes::from(body)))
+            .unwrap();
+
+        let bytes = request.encode().await.unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(output.contains("POST /api/submit HTTP/1.1"));
+        assert!(output.contains(body));
+    }
+
+    #[tokio::test]
+    async fn test_http2_request_rejected() {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/")
+            .version(http::Version::HTTP_2)
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let result = request.encode().await;
+        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
+    }
+
+    #[test]
+    fn test_decode_request_no_body() {
+        let raw = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, Some(raw.len()));
+    }
+
+    #[test]
+    fn test_decode_request_with_content_length() {
+        let raw = b"POST /api/users HTTP/1.1\r\nHost: example.com\r\nContent-Length: 14\r\n\r\n{\"name\":\"foo\"}";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, Some(raw.len()));
+    }
+
+    #[test]
+    fn test_decode_request_incomplete_body() {
+        // Content-Length says 13, but body is only 5 bytes
+        let raw =
+            b"POST /api/users HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\n\r\nhello";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_request_incomplete_headers() {
+        let raw = b"POST /api/users HTTP/1.1\r\nHost: example.com\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_request_chunked_encoding() {
+        let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, Some(raw.len()));
+    }
+
+    #[test]
+    fn test_decode_request_chunked_multiple_chunks() {
+        let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, Some(raw.len()));
+    }
+
+    #[test]
+    fn test_decode_request_chunked_incomplete() {
+        // Missing final 0\r\n\r\n
+        let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_decode_request_extra_data_after() {
+        // Buffer has extra data after the request - should return correct length
+        let request = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+        let mut raw = request.to_vec();
+        raw.extend_from_slice(b"extra garbage data");
+        let result = DummyRequest::decode(&raw);
+        assert_eq!(result, Some(request.len()));
+    }
+
+    #[test]
+    fn test_decode_request_chunked_case_insensitive() {
+        let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: CHUNKED\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+        let result = DummyRequest::decode(raw);
+        assert_eq!(result, Some(raw.len()));
     }
 }
