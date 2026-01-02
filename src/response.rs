@@ -1,3 +1,11 @@
+//! HTTP response encoding and decoding.
+//!
+//! This module provides:
+//! - [`WireEncode`] implementation for `http::Response<B>` - encodes responses to wire format
+//! - [`ResponseStatusCode`] - parses raw bytes to extract status code and determine complete response length
+//!
+//! Supports `Content-Length`, `Transfer-Encoding: chunked`, and special status codes (1xx, 204, 304) without bodies.
+
 use bytes::Bytes;
 use http::{Request, StatusCode};
 use http_body_util::Empty;
@@ -81,6 +89,26 @@ where
     }
 }
 
+/// Decoder for extracting HTTP response status code and message length.
+///
+/// Returns `(StatusCode, usize)` containing the status code and total length in bytes
+/// of a complete HTTP response (headers + body), or `None` if incomplete or malformed.
+///
+/// Correctly handles status codes without bodies (1xx, 204, 304), `Content-Length`,
+/// and `Transfer-Encoding: chunked`.
+///
+/// # Example
+///
+/// ```rust
+/// use http_wire::WireDecode;
+/// use http_wire::response::ResponseStatusCode;
+/// use http::StatusCode;
+///
+/// let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+/// let (status, length) = ResponseStatusCode::decode(raw).unwrap();
+/// assert_eq!(status, StatusCode::OK);
+/// assert_eq!(length, raw.len());
+/// ```
 pub struct ResponseStatusCode;
 
 impl WireDecode for ResponseStatusCode {

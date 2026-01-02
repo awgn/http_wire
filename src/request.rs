@@ -1,3 +1,11 @@
+//! HTTP request encoding and decoding.
+//!
+//! This module provides:
+//! - [`WireEncode`] implementation for `http::Request<B>` - encodes requests to wire format
+//! - [`RequestLength`] - parses raw bytes to determine complete request length
+//!
+//! Both `Content-Length` and `Transfer-Encoding: chunked` are fully supported.
+
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::Empty;
@@ -86,6 +94,23 @@ where
     }
 }
 
+/// Decoder for determining HTTP request message length.
+///
+/// Returns the total length in bytes of a complete HTTP request (headers + body),
+/// or `None` if the request is incomplete or malformed.
+///
+/// Supports `Content-Length`, `Transfer-Encoding: chunked`, and bodyless requests.
+///
+/// # Example
+///
+/// ```rust
+/// use http_wire::WireDecode;
+/// use http_wire::request::RequestLength;
+///
+/// let raw = b"POST /api HTTP/1.1\r\nHost: example.com\r\nContent-Length: 5\r\n\r\nhello";
+/// let length = RequestLength::decode(raw).unwrap();
+/// assert_eq!(length, raw.len());
+/// ```
 pub struct RequestLength;
 
 impl WireDecode for RequestLength {
