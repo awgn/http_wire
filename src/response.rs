@@ -13,9 +13,9 @@ use crate::{WireDecode, WireEncode};
 
 impl<B> WireEncode for http::Response<B>
 where
-    B: hyper::body::Body + Clone + Send + Sync + 'static,
-    B::Error: std::error::Error + Send + Sync + 'static,
     B::Data: Send + Sync + 'static,
+    B: hyper::body::Body + Clone + Send + Sync + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     async fn encode(self) -> Result<Bytes, WireError> {
         use std::convert::Infallible;

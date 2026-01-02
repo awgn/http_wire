@@ -12,9 +12,9 @@ use crate::{ WireDecode, WireEncode};
 
 impl<B> WireEncode for http::Request<B>
 where
-    B: http_body_util::BodyExt + Send + Sync + 'static,
-    B::Error: std::error::Error + Send + Sync + 'static,
     B::Data: Send + Sync + 'static,
+    B: http_body_util::BodyExt + Send + Sync + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     #[inline]
     async fn encode(self) -> Result<Bytes, WireError> {
