@@ -90,7 +90,7 @@ Use the `WireDecode` trait to parse raw HTTP bytes and determine message boundar
 
 ### Parsing Request Length
 
-Use `RequestLength` to determine the total length of an HTTP request in a byte buffer:
+Use `RequestLength` to determine the total length of an HTTP request, including its body, in a byte buffer:
 
 ```rust
 use http_wire::WireDecode;
@@ -193,32 +193,10 @@ async fn main() -> Result<(), WireError> {
 - `Sync` - Internal synchronization error
 - `UnsupportedVersion` - HTTP version not supported (only HTTP/1.0 and HTTP/1.1 are supported)
 
-## HTTP/2 Rejection
-
-Attempting to encode HTTP/2 requests or responses will return an error:
-
-```rust
-use http_wire::{WireEncode, WireError};
-
-#[tokio::main]
-async fn main() {
-    let request = http::Request::builder()
-        .method("GET")
-        .uri("/")
-        .version(http::Version::HTTP_2)
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .unwrap();
-
-    let result = request.encode().await;
-    assert!(matches!(result, Err(WireError::UnsupportedVersion)));
-}
-```
-
 ## Features
 
 - Full support for chunked transfer encoding
 - Handles requests and responses with or without bodies
-- Proper handling of special status codes (1xx, 204, 304) that never have bodies
 - Case-insensitive header parsing
 - Zero-copy parsing for determining message boundaries
 - HTTP/1.0 and HTTP/1.1 support
