@@ -1,7 +1,7 @@
 use bytes::Bytes;
-use http::{Request, Response, StatusCode};
+use http::{Request, StatusCode};
 use http_body_util::Empty;
-use hyper::{body::Body, service::service_fn};
+use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
 use tokio::io::duplex;
 use tokio::sync::oneshot;
@@ -18,8 +18,66 @@ where
     B::Data: Send + Sync + 'static,
 {
     async fn encode(self) -> Result<Bytes, WireError> {
-        let bytes = to_bytes(self).await?;
-        Ok(Bytes::from(bytes))
+        use std::convert::Infallible;
+
+        // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
+        let version = self.version();
+        if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
+            return Err(WireError::UnsupportedVersion);
+        }
+
+        let (client, server) = duplex(8192);
+        let capture_server = WireCapture::new(server);
+        let captured_ref = capture_server.captured.clone();
+
+        let (tx, rx) = oneshot::channel::<Result<(), WireError>>();
+
+        let handle = tokio::spawn(async move {
+            let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
+                let res = self.clone();
+                async move { Ok::<_, Infallible>(res) }
+            });
+
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(capture_server), service)
+                .await
+        });
+
+        let req = hyper::Request::builder()
+            .method("GET")
+            .uri("/")
+            .header("host", "localhost")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        tokio::spawn(async move {
+            let client_connection = hyper::client::conn::http1::Builder::new()
+                .handshake(TokioIo::new(client))
+                .await;
+
+            match client_connection {
+                Ok((mut sender, connection)) => {
+                    tokio::spawn(connection);
+                    // When send_request completes, the response has been received
+                    let result = sender
+                        .send_request(req)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| WireError::Connection(Box::new(e)));
+                    let _ = tx.send(result);
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(WireError::Connection(Box::new(e))));
+                }
+            }
+        });
+
+        // Wait for completion
+        rx.await.map_err(|_| WireError::Sync)??;
+        let _ = handle.await;
+
+        let result = captured_ref.lock().clone();
+        Ok(Bytes::from(result))
     }
 }
 
@@ -81,75 +139,7 @@ impl WireDecode for DummyResponse {
     }
 }
 
-/// Serialize an HTTP response to raw bytes using hyper's HTTP/1.1 serialization.
-/// This uses a duplex stream to capture the exact bytes that would be sent over the wire.
-async fn to_bytes<B>(response: Response<B>) -> Result<Vec<u8>, WireError>
-where
-    B: Body + Clone + Send + Sync + 'static,
-    <B as Body>::Error: std::error::Error + Send + Sync + 'static,
-    <B as Body>::Data: Send + Sync + 'static,
-{
-    use std::convert::Infallible;
 
-    // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
-    let version = response.version();
-    if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
-        return Err(WireError::UnsupportedVersion);
-    }
-
-    let (client, server) = duplex(8192);
-    let capture_server = WireCapture::new(server);
-    let captured_ref = capture_server.captured.clone();
-
-    let (tx, rx) = oneshot::channel::<Result<(), WireError>>();
-
-    let handle = tokio::spawn(async move {
-        let service = service_fn(move |_req: Request<hyper::body::Incoming>| {
-            let res = response.clone();
-            async move { Ok::<_, Infallible>(res) }
-        });
-
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(capture_server), service)
-            .await
-    });
-
-    let req = hyper::Request::builder()
-        .method("GET")
-        .uri("/")
-        .header("host", "localhost")
-        .body(Empty::<Bytes>::new())
-        .unwrap();
-
-    tokio::spawn(async move {
-        let client_connection = hyper::client::conn::http1::Builder::new()
-            .handshake(TokioIo::new(client))
-            .await;
-
-        match client_connection {
-            Ok((mut sender, connection)) => {
-                tokio::spawn(connection);
-                // When send_request completes, the response has been received
-                let result = sender
-                    .send_request(req)
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| WireError::Connection(Box::new(e)));
-                let _ = tx.send(result);
-            }
-            Err(e) => {
-                let _ = tx.send(Err(WireError::Connection(Box::new(e))));
-            }
-        }
-    });
-
-    // Wait for completion
-    rx.await.map_err(|_| WireError::Sync)??;
-    let _ = handle.await;
-
-    let result = captured_ref.lock().clone();
-    Ok(result)
-}
 
 #[cfg(test)]
 mod tests {
@@ -164,7 +154,7 @@ mod tests {
             .body(Full::new(Bytes::from("Hello World")))
             .unwrap();
 
-        let bytes = to_bytes(response).await.unwrap();
+        let bytes = response.encode().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 Response:\n{}", output);
@@ -181,7 +171,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = to_bytes(response).await.unwrap();
+        let bytes = response.encode().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         // Verify the response has proper HTTP structure
