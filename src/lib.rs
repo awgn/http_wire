@@ -17,6 +17,3 @@ pub trait WireDecode: Sized {
     type Output;
     fn decode(bytes: &[u8]) -> Option<Self::Output>;
 }
-
-pub struct DummyRequest;
-pub struct DummyResponse;

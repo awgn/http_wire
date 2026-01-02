@@ -8,7 +8,7 @@ use tokio::sync::oneshot;
 use crate::error::WireError;
 use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
 use crate::wire::WireCapture;
-use crate::{DummyRequest, WireDecode, WireEncode};
+use crate::{ WireDecode, WireEncode};
 
 impl<B> WireEncode for http::Request<B>
 where
@@ -86,7 +86,9 @@ where
     }
 }
 
-impl WireDecode for DummyRequest {
+pub struct RequestLength;
+
+impl WireDecode for RequestLength {
     type Output = usize;
 
     fn decode(buf: &[u8]) -> Option<Self::Output> {
@@ -184,14 +186,14 @@ mod tests {
     #[test]
     fn test_decode_request_no_body() {
         let raw = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, Some(raw.len()));
     }
 
     #[test]
     fn test_decode_request_with_content_length() {
         let raw = b"POST /api/users HTTP/1.1\r\nHost: example.com\r\nContent-Length: 14\r\n\r\n{\"name\":\"foo\"}";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, Some(raw.len()));
     }
 
@@ -200,28 +202,28 @@ mod tests {
         // Content-Length says 13, but body is only 5 bytes
         let raw =
             b"POST /api/users HTTP/1.1\r\nHost: example.com\r\nContent-Length: 13\r\n\r\nhello";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_decode_request_incomplete_headers() {
         let raw = b"POST /api/users HTTP/1.1\r\nHost: example.com\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_decode_request_chunked_encoding() {
         let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, Some(raw.len()));
     }
 
     #[test]
     fn test_decode_request_chunked_multiple_chunks() {
         let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, Some(raw.len()));
     }
 
@@ -229,7 +231,7 @@ mod tests {
     fn test_decode_request_chunked_incomplete() {
         // Missing final 0\r\n\r\n
         let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, None);
     }
 
@@ -239,14 +241,14 @@ mod tests {
         let request = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let mut raw = request.to_vec();
         raw.extend_from_slice(b"extra garbage data");
-        let result = DummyRequest::decode(&raw);
+        let result = RequestLength::decode(&raw);
         assert_eq!(result, Some(request.len()));
     }
 
     #[test]
     fn test_decode_request_chunked_case_insensitive() {
         let raw = b"POST /api/data HTTP/1.1\r\nHost: example.com\r\nTransfer-Encoding: CHUNKED\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = DummyRequest::decode(raw);
+        let result = RequestLength::decode(raw);
         assert_eq!(result, Some(raw.len()));
     }
 }

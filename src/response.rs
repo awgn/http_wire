@@ -9,7 +9,7 @@ use tokio::sync::oneshot;
 use crate::error::WireError;
 use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
 use crate::wire::WireCapture;
-use crate::{DummyResponse, WireDecode, WireEncode};
+use crate::{WireDecode, WireEncode};
 
 impl<B> WireEncode for http::Response<B>
 where
@@ -81,7 +81,9 @@ where
     }
 }
 
-impl WireDecode for DummyResponse {
+pub struct ResponseStatusCode;
+
+impl WireDecode for ResponseStatusCode {
     type Output = (StatusCode, usize);
 
     fn decode(buf: &[u8]) -> Option<Self::Output> {
@@ -145,6 +147,7 @@ impl WireDecode for DummyResponse {
 mod tests {
     use super::*;
     use http_body_util::Full;
+    use http::Response;
 
     #[tokio::test]
     async fn test_http1_capture() {
@@ -230,14 +233,14 @@ mod tests {
     #[test]
     fn test_decode_response_no_body() {
         let raw = b"HTTP/1.1 204 No Content\r\nServer: test\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::NO_CONTENT, raw.len())));
     }
 
     #[test]
     fn test_decode_response_with_content_length() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::OK, raw.len())));
     }
 
@@ -245,28 +248,28 @@ mod tests {
     fn test_decode_response_incomplete_body() {
         // Content-Length says 10, but body is only 5 bytes
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nhello";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_decode_response_incomplete_headers() {
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_decode_response_chunked_encoding() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::OK, raw.len())));
     }
 
     #[test]
     fn test_decode_response_chunked_multiple_chunks() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::OK, raw.len())));
     }
 
@@ -274,7 +277,7 @@ mod tests {
     fn test_decode_response_chunked_incomplete() {
         // Missing final 0\r\n\r\n
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, None);
     }
 
@@ -284,14 +287,14 @@ mod tests {
         let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
         let mut raw = response.to_vec();
         raw.extend_from_slice(b"extra garbage data");
-        let result = DummyResponse::decode(&raw);
+        let result = ResponseStatusCode::decode(&raw);
         assert_eq!(result, Some((StatusCode::OK, response.len())));
     }
 
     #[test]
     fn test_decode_response_chunked_case_insensitive() {
         let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: CHUNKED\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::OK, raw.len())));
     }
 
@@ -299,7 +302,7 @@ mod tests {
     fn test_decode_response_304_no_body() {
         // 304 responses never have a body
         let raw = b"HTTP/1.1 304 Not Modified\r\nETag: \"abc\"\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::NOT_MODIFIED, raw.len())));
     }
 
@@ -307,7 +310,7 @@ mod tests {
     fn test_decode_response_1xx_no_body() {
         // 1xx responses never have a body
         let raw = b"HTTP/1.1 100 Continue\r\n\r\n";
-        let result = DummyResponse::decode(raw);
+        let result = ResponseStatusCode::decode(raw);
         assert_eq!(result, Some((StatusCode::CONTINUE, raw.len())));
     }
 }
