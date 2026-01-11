@@ -1,6 +1,6 @@
 [package]
 name = "http_wire"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 authors = ["Nicola Bonelli <nicola@larthia.com>"]
 description = "Serialize HTTP/1.1 requests and responses to wire format bytes"
@@ -20,4 +20,4 @@ hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1.19", features = ["tokio"] }
 parking_lot = "0.12.5"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["io-std", "io-util", "macros", "rt", "time"] }
+tokio = { version = "1.49.0", features = ["io-std", "io-util", "macros", "rt", "time"] }
