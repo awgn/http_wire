@@ -1,6 +1,6 @@
 //! Example demonstrating synchronous HTTP encoding without requiring an async runtime.
 //!
-//! This example shows how to use `WireEncodeSync` to encode HTTP requests and responses
+//! This example shows how to use `WireEncode` to encode HTTP requests and responses
 //! in a synchronous context (e.g., in a non-async main function or library).
 //!
 //! Run with: cargo run --example sync_encode
@@ -8,7 +8,7 @@
 use bytes::Bytes;
 use http::{Request, Response};
 use http_body_util::{Empty, Full};
-use http_wire::WireEncodeSync;
+use http_wire::WireEncode;
 
 fn main() {
     println!("=== Synchronous HTTP Encoding Example ===\n");
@@ -23,7 +23,7 @@ fn main() {
         .body(Empty::<Bytes>::new())
         .unwrap();
 
-    match request.encode_sync() {
+    match request.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);
@@ -44,7 +44,7 @@ fn main() {
         .body(Full::new(Bytes::from(body)))
         .unwrap();
 
-    match request.encode_sync() {
+    match request.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);
@@ -62,7 +62,7 @@ fn main() {
         .body(Empty::<Bytes>::new())
         .unwrap();
 
-    match request.encode_sync() {
+    match request.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);
@@ -80,7 +80,7 @@ fn main() {
         .body(Full::new(Bytes::from(r#"{"status":"success"}"#)))
         .unwrap();
 
-    match response.encode_sync() {
+    match response.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);
@@ -97,7 +97,7 @@ fn main() {
         .body(Full::new(Bytes::from("Resource not found")))
         .unwrap();
 
-    match response.encode_sync() {
+    match response.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);
@@ -114,7 +114,7 @@ fn main() {
         .body(Empty::<Bytes>::new())
         .unwrap();
 
-    match response.encode_sync() {
+    match response.encode() {
         Ok(bytes) => {
             let output = String::from_utf8_lossy(&bytes);
             println!("{}", output);

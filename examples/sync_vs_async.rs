@@ -1,6 +1,6 @@
 //! Example comparing synchronous vs asynchronous HTTP encoding.
 //!
-//! This example demonstrates both `WireEncodeSync` and `WireEncode` to show
+//! This example demonstrates both `WireEncode` (sync) and `WireEncodeAsync` to show
 //! when to use each approach.
 //!
 //! Run with: cargo run --example sync_vs_async
@@ -8,19 +8,19 @@
 use bytes::Bytes;
 use http::Request;
 use http_body_util::Full;
-use http_wire::{WireEncode, WireEncodeSync};
+use http_wire::{WireEncode, WireEncodeAsync};
 
 fn main() {
     println!("=== Sync vs Async HTTP Encoding ===\n");
 
     // Scenario 1: Synchronous encoding in regular functions
-    println!("Scenario 1: Using WireEncodeSync in a regular function");
+    println!("Scenario 1: Using WireEncode in a regular function");
     println!("-----------------------------------------------------------");
     synchronous_example();
     println!();
 
     // Scenario 2: Async encoding in async context
-    println!("Scenario 2: Using WireEncode in an async context");
+    println!("Scenario 2: Using WireEncodeAsync in an async context");
     println!("-----------------------------------------------------------");
     async_example();
 }
@@ -36,8 +36,8 @@ fn synchronous_example() {
         .body(Full::new(Bytes::from("request data")))
         .unwrap();
 
-    // Use encode_sync() - works in regular synchronous code
-    match request.encode_sync() {
+    // Use encode() - works in regular synchronous code
+    match request.encode() {
         Ok(bytes) => {
             println!("✓ Encoded {} bytes synchronously", bytes.len());
             println!("  First 50 chars: {:?}", &String::from_utf8_lossy(&bytes[..50.min(bytes.len())]));
@@ -45,7 +45,7 @@ fn synchronous_example() {
         Err(e) => eprintln!("✗ Error: {}", e),
     }
 
-    println!("\nUse WireEncodeSync when:");
+    println!("\nUse WireEncode when:");
     println!("  • You're in synchronous code (no async runtime)");
     println!("  • You're writing CLI tools or scripts");
     println!("  • You're in a library that needs to support both sync and async users");
@@ -71,8 +71,8 @@ fn async_example() {
             .body(Full::new(Bytes::from(r#"{"key":"value"}"#)))
             .unwrap();
 
-        // Use encode() - async version
-        match request.encode().await {
+        // Use encode_async() - async version
+        match request.encode_async().await {
             Ok(bytes) => {
                 println!("✓ Encoded {} bytes asynchronously", bytes.len());
                 println!("  First 50 chars: {:?}", &String::from_utf8_lossy(&bytes[..50.min(bytes.len())]));
@@ -80,7 +80,7 @@ fn async_example() {
             Err(e) => eprintln!("✗ Error: {}", e),
         }
 
-        println!("\nUse WireEncode (async) when:");
+        println!("\nUse WireEncodeAsync when:");
         println!("  • You're already in an async runtime (e.g., existing Tokio app)");
         println!("  • You're building async web servers or clients");
         println!("  • You need to integrate with other async operations");
@@ -105,7 +105,7 @@ mod tests {
                 .body(Full::new(Bytes::from("test")))
                 .unwrap();
 
-            let _ = request.encode_sync().unwrap();
+            let _ = request.encode().unwrap();
         }
 
         let duration = start.elapsed();
@@ -124,7 +124,7 @@ mod tests {
                 .body(Full::new(Bytes::from("test")))
                 .unwrap();
 
-            let _ = request.encode().await.unwrap();
+            let _ = request.encode_async().await.unwrap();
         }
 
         let duration = start.elapsed();

@@ -1,7 +1,7 @@
 //! HTTP request encoding and decoding.
 //!
 //! This module provides:
-//! - [`WireEncode`] implementation for `http::Request<B>` - encodes requests to wire format
+//! - [`WireEncodeAsync`] implementation for `http::Request<B>` - encodes requests to wire format
 //! - [`RequestLength`] - parses raw bytes to determine complete request length
 //!
 //! Both `Content-Length` and `Transfer-Encoding: chunked` are fully supported.
@@ -16,16 +16,16 @@ use tokio::sync::oneshot;
 use crate::error::WireError;
 use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
 use crate::wire::WireCapture;
-use crate::{ WireDecode, WireEncode};
+use crate::{ WireDecode, WireEncodeAsync};
 
-impl<B> WireEncode for http::Request<B>
+impl<B> WireEncodeAsync for http::Request<B>
 where
     B::Data: Send + Sync + 'static,
     B: http_body_util::BodyExt + Send + Sync + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     #[inline]
-    async fn encode(self) -> Result<Bytes, WireError> {
+    async fn encode_async(self) -> Result<Bytes, WireError> {
         use hyper::service::service_fn;
         use std::convert::Infallible;
 
@@ -170,7 +170,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let bytes = request.encode().await.unwrap();
+        let bytes = request.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.contains("GET /api/test HTTP/1.1"));
@@ -188,7 +188,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = request.encode().await.unwrap();
+        let bytes = request.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.contains("POST /api/submit HTTP/1.1"));
@@ -204,7 +204,7 @@ mod tests {
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = request.encode().await;
+        let result = request.encode_async().await;
         assert!(matches!(result, Err(WireError::UnsupportedVersion)));
     }
 

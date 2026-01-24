@@ -1,7 +1,7 @@
 //! HTTP response encoding and decoding.
 //!
 //! This module provides:
-//! - [`WireEncode`] implementation for `http::Response<B>` - encodes responses to wire format
+//! - [`WireEncodeAsync`] implementation for `http::Response<B>` - encodes responses to wire format
 //! - [`ResponseStatusCode`] - parses raw bytes to extract status code and determine complete response length
 //!
 //! Supports `Content-Length`, `Transfer-Encoding: chunked`, and special status codes (1xx, 204, 304) without bodies.
@@ -17,15 +17,15 @@ use tokio::sync::oneshot;
 use crate::error::WireError;
 use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
 use crate::wire::WireCapture;
-use crate::{WireDecode, WireEncode};
+use crate::{WireDecode, WireEncodeAsync};
 
-impl<B> WireEncode for http::Response<B>
+impl<B> WireEncodeAsync for http::Response<B>
 where
     B::Data: Send + Sync + 'static,
     B: hyper::body::Body + Clone + Send + Sync + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
-    async fn encode(self) -> Result<Bytes, WireError> {
+    async fn encode_async(self) -> Result<Bytes, WireError> {
         use std::convert::Infallible;
 
         // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
@@ -185,7 +185,7 @@ mod tests {
             .body(Full::new(Bytes::from("Hello World")))
             .unwrap();
 
-        let bytes = response.encode().await.unwrap();
+        let bytes = response.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         println!("HTTP/1.1 Response:\n{}", output);
@@ -202,7 +202,7 @@ mod tests {
             .body(Full::new(Bytes::from(body)))
             .unwrap();
 
-        let bytes = response.encode().await.unwrap();
+        let bytes = response.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         // Verify the response has proper HTTP structure
@@ -225,7 +225,7 @@ mod tests {
             .body(Full::new(Bytes::from("Hello")))
             .unwrap();
 
-        let bytes = response.encode().await.unwrap();
+        let bytes = response.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.contains("HTTP/1.1 200 OK"));
@@ -239,7 +239,7 @@ mod tests {
             .body(Full::new(Bytes::from("Not Found")))
             .unwrap();
 
-        let bytes = response.encode().await.unwrap();
+        let bytes = response.encode_async().await.unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.contains("HTTP/1.1 404"));
@@ -254,7 +254,7 @@ mod tests {
             .body(Full::new(Bytes::from("Hello")))
             .unwrap();
 
-        let result = response.encode().await;
+        let result = response.encode_async().await;
         assert!(matches!(result, Err(WireError::UnsupportedVersion)));
     }
 

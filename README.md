@@ -17,15 +17,15 @@ http_wire = "0.2"
 
 The library provides two ways to encode HTTP messages:
 
-1. **Async encoding** with `WireEncode` - requires an async runtime (Tokio)
-2. **Sync encoding** with `WireEncodeSync` - works in synchronous code without requiring an async runtime
+1. **Sync encoding** with `WireEncode` - works in synchronous code without requiring an async runtime (Recommended for most use cases)
+2. **Async encoding** with `WireEncodeAsync` - requires an async runtime (Tokio)
 
-### Synchronous Encoding (Recommended for non-async code)
+### Synchronous Encoding (Recommended for most use cases)
 
-Use `WireEncodeSync` to encode HTTP messages in synchronous contexts without needing to set up an async runtime:
+Use `WireEncode` to encode HTTP messages in synchronous contexts without needing to set up an async runtime:
 
 ```rust
-use http_wire::WireEncodeSync;
+use http_wire::WireEncode;
 use http::Request;
 use http_body_util::Full;
 use bytes::Bytes;
@@ -39,7 +39,7 @@ fn main() {
         .body(Full::new(Bytes::from(r#"{"name":"John"}"#)))
         .unwrap();
 
-    let bytes = request.encode_sync().unwrap();
+    let bytes = request.encode().unwrap();
     // bytes contains the full HTTP/1.1 request with body
 }
 ```
@@ -47,7 +47,7 @@ fn main() {
 This works for both requests and responses:
 
 ```rust
-use http_wire::WireEncodeSync;
+use http_wire::WireEncode;
 use http::Response;
 use http_body_util::Full;
 use bytes::Bytes;
@@ -59,16 +59,20 @@ fn main() {
         .body(Full::new(Bytes::from("Hello World")))
         .unwrap();
 
-    let bytes = response.encode_sync().unwrap();
+    let bytes = response.encode().unwrap();
 }
 ```
 
-**Note:** `WireEncodeSync` creates a minimal single-threaded Tokio runtime internally and blocks until encoding completes. This provides the convenience of synchronous code while still leveraging Hyper's correct HTTP serialization.
+**Note:** `WireEncode` creates a minimal single-threaded Tokio runtime internally and blocks until encoding completes. This provides the convenience of synchronous code while still leveraging Hyper's correct HTTP serialization.
 
-### Async Encoding Requests
+### Async Encoding
+
+For code that's already running in an async context, you can use `WireEncodeAsync`:
+
+#### Async Encoding Requests
 
 ```rust
-use http_wire::WireEncode;
+use http_wire::WireEncodeAsync;
 use http::Request;
 use http_body_util::Empty;
 use bytes::Bytes;
@@ -82,15 +86,15 @@ async fn main() {
         .body(Empty::<Bytes>::new())
         .unwrap();
 
-    let bytes = request.encode().await.unwrap();
+    let bytes = request.encode_async().await.unwrap();
     // bytes contains: "GET /api/users HTTP/1.1\r\nhost: example.com\r\n\r\n"
 }
 ```
 
-### Encoding Requests with Body
+#### Encoding Requests with Body
 
 ```rust
-use http_wire::WireEncode;
+use http_wire::WireEncodeAsync;
 use http::Request;
 use http_body_util::Full;
 use bytes::Bytes;
@@ -106,15 +110,15 @@ async fn main() {
         .body(Full::new(Bytes::from(body)))
         .unwrap();
 
-    let bytes = request.encode().await.unwrap();
+    let bytes = request.encode_async().await.unwrap();
     // bytes contains the full HTTP/1.1 request with body
 }
 ```
 
-### Encoding Responses
+#### Encoding Responses
 
 ```rust
-use http_wire::WireEncode;
+use http_wire::WireEncodeAsync;
 use http::Response;
 use http_body_util::Full;
 use bytes::Bytes;
@@ -127,7 +131,7 @@ async fn main() {
         .body(Full::new(Bytes::from("Hello World")))
         .unwrap();
 
-    let bytes = response.encode().await.unwrap();
+    let bytes = response.encode_async().await.unwrap();
     // bytes contains: "HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\n..."
 }
 ```
@@ -223,8 +227,24 @@ fn parse_stream(buffer: &[u8]) -> Option<(&[u8], &[u8])> {
 Both sync and async encoding use the same error types:
 
 ```rust
-// Async version
+// Sync version (recommended)
 use http_wire::{WireEncode, WireError};
+
+fn main() -> Result<(), WireError> {
+    let request = http::Request::builder()
+        .uri("/")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+
+    let bytes = request.encode()?;
+    println!("Serialized {} bytes", bytes.len());
+    Ok(())
+}
+```
+
+```rust
+// Async version
+use http_wire::{WireEncodeAsync, WireError};
 
 #[tokio::main]
 async fn main() -> Result<(), WireError> {
@@ -233,23 +253,7 @@ async fn main() -> Result<(), WireError> {
         .body(http_body_util::Empty::<bytes::Bytes>::new())
         .unwrap();
 
-    let bytes = request.encode().await?;
-    println!("Serialized {} bytes", bytes.len());
-    Ok(())
-}
-```
-
-```rust
-// Sync version
-use http_wire::{WireEncodeSync, WireError};
-
-fn main() -> Result<(), WireError> {
-    let request = http::Request::builder()
-        .uri("/")
-        .body(http_body_util::Empty::<bytes::Bytes>::new())
-        .unwrap();
-
-    let bytes = request.encode_sync()?;
+    let bytes = request.encode_async().await?;
     println!("Serialized {} bytes", bytes.len());
     Ok(())
 }
