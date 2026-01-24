@@ -15,9 +15,57 @@ http_wire = "0.2"
 
 ## Encoding (Serialization)
 
-Use the `WireEncode` trait to serialize HTTP requests and responses to their wire format bytes.
+The library provides two ways to encode HTTP messages:
 
-### Encoding Requests
+1. **Async encoding** with `WireEncode` - requires an async runtime (Tokio)
+2. **Sync encoding** with `WireEncodeSync` - works in synchronous code without requiring an async runtime
+
+### Synchronous Encoding (Recommended for non-async code)
+
+Use `WireEncodeSync` to encode HTTP messages in synchronous contexts without needing to set up an async runtime:
+
+```rust
+use http_wire::WireEncodeSync;
+use http::Request;
+use http_body_util::Full;
+use bytes::Bytes;
+
+fn main() {
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/users")
+        .header("Host", "example.com")
+        .header("Content-Type", "application/json")
+        .body(Full::new(Bytes::from(r#"{"name":"John"}"#)))
+        .unwrap();
+
+    let bytes = request.encode_sync().unwrap();
+    // bytes contains the full HTTP/1.1 request with body
+}
+```
+
+This works for both requests and responses:
+
+```rust
+use http_wire::WireEncodeSync;
+use http::Response;
+use http_body_util::Full;
+use bytes::Bytes;
+
+fn main() {
+    let response = Response::builder()
+        .status(200)
+        .header("Content-Type", "text/plain")
+        .body(Full::new(Bytes::from("Hello World")))
+        .unwrap();
+
+    let bytes = response.encode_sync().unwrap();
+}
+```
+
+**Note:** `WireEncodeSync` creates a minimal single-threaded Tokio runtime internally and blocks until encoding completes. This provides the convenience of synchronous code while still leveraging Hyper's correct HTTP serialization.
+
+### Async Encoding Requests
 
 ```rust
 use http_wire::WireEncode;
@@ -172,7 +220,10 @@ fn parse_stream(buffer: &[u8]) -> Option<(&[u8], &[u8])> {
 
 ## Error Handling
 
+Both sync and async encoding use the same error types:
+
 ```rust
+// Async version
 use http_wire::{WireEncode, WireError};
 
 #[tokio::main]
@@ -183,6 +234,22 @@ async fn main() -> Result<(), WireError> {
         .unwrap();
 
     let bytes = request.encode().await?;
+    println!("Serialized {} bytes", bytes.len());
+    Ok(())
+}
+```
+
+```rust
+// Sync version
+use http_wire::{WireEncodeSync, WireError};
+
+fn main() -> Result<(), WireError> {
+    let request = http::Request::builder()
+        .uri("/")
+        .body(http_body_util::Empty::<bytes::Bytes>::new())
+        .unwrap();
+
+    let bytes = request.encode_sync()?;
     println!("Serialized {} bytes", bytes.len());
     Ok(())
 }
