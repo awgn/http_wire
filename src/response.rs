@@ -147,11 +147,42 @@ where
 /// assert_eq!(length, raw.len());
 /// ```
 pub struct FullResponse<'headers, 'buf> {
+    /// The parsed HTTP response headers and status line.
+    ///
+    /// Contains the HTTP version, status code, reason phrase, and headers.
+    /// Use `head.code` to access the status code, `head.reason` for the reason phrase,
+    /// and `head.headers` to iterate over the headers.
     pub head: httparse::Response<'headers, 'buf>,
+    /// The response body as a byte slice.
+    ///
+    /// This is a reference into the original buffer passed to [`parse`](Self::parse)
+    /// or [`decode`](WireDecode::decode). It contains the complete body content
+    /// after decoding any transfer encodings (chunked or content-length).
     pub body: &'buf [u8],
 }
 
 impl<'headers, 'buf> FullResponse<'headers, 'buf> {
+    /// Parse an HTTP response from raw bytes.
+    ///
+    /// This method parses the HTTP response from the provided buffer, extracting
+    /// the status code, headers, and body. It correctly handles responses with
+    /// no body (1xx, 204, 304), `Content-Length` specified bodies, and
+    /// `Transfer-Encoding: chunked` bodies.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP response bytes
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(total_len)` where `total_len` is the complete message length (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::PartialHead`] if headers are incomplete,
+    /// [`WireError::HttparseError`] if header parsing fails,
+    /// [`WireError::InvalidChunkedBody`] if chunked encoding is malformed,
+    /// or [`WireError::IncompleteBody`] if the body is shorter than specified by `Content-Length`.
     pub fn parse(&mut self, buf: &'buf [u8]) -> Result<usize, WireError> {
         match self.head.parse(buf) {
             Ok(httparse::Status::Complete(headers_len)) => {

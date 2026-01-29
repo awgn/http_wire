@@ -126,13 +126,40 @@ where
 /// Supports `Content-Length`, `Transfer-Encoding: chunked`, and body-less requests.
 ///
 pub struct FullRequest<'headers, 'buf> {
+    /// The parsed HTTP request headers and request line.
+    ///
+    /// Contains the HTTP method, request path, HTTP version, and headers.
+    /// Use `head.method` to access the method, `head.path` for the request path,
+    /// and `head.headers` to iterate over the headers.
     pub head: httparse::Request<'headers, 'buf>,
+    /// The request body as a byte slice.
+    ///
+    /// This is a reference into the original buffer passed to [`parse`](Self::parse)
+    /// or [`decode`](WireDecode::decode). It contains the complete body content
+    /// after decoding any transfer encodings (chunked or content-length).
     pub body: &'buf [u8],
 }
 
 impl<'headers, 'buf> FullRequest<'headers, 'buf> {
-    /// Core parsing logic shared between parse and parse_uninit.
-    /// Assumes headers have already been parsed and self.head.headers is populated.
+    /// Core parsing logic shared between [`parse`](Self::parse) and [`parse_uninit`](Self::parse_uninit).
+    ///
+    /// This method processes the body of an HTTP request after headers have been parsed.
+    /// It examines `Content-Length` and `Transfer-Encoding` headers to determine how
+    /// many bytes constitute the complete message.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP message bytes
+    /// * `headers_len` - The length of the headers section in bytes (including the `\r\n\r\n` terminator)
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(total_len)` where `total_len` is the complete message length (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::InvalidChunkedBody`] if chunked encoding is malformed,
+    /// or [`WireError::IncompleteBody`] if the body is shorter than specified by `Content-Length`.
     fn parse_core(&mut self, buf: &'buf [u8], headers_len: usize) -> Result<usize, WireError> {
         let mut content_len: Option<usize> = None;
         let mut is_chunked = false;
@@ -166,7 +193,28 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
         }
     }
 
-    /// Parse using initialized headers (compatible with httparse::Request::parse).
+    /// Parse an HTTP request using initialized headers storage.
+    ///
+    /// This method parses the HTTP request from the provided buffer, using
+    /// pre-initialized header storage. It is compatible with
+    /// [`httparse::Request::parse`](httparse::Request::parse).
+    ///
+    /// For a version that avoids initializing headers (performance optimization),
+    /// see [`parse_uninit`](Self::parse_uninit).
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP message bytes
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(total_len)` where `total_len` is the complete message length (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::PartialHead`] if headers are incomplete,
+    /// [`WireError::HttparseError`] if header parsing fails,
+    /// or errors from [`parse_core`](Self::parse_core) for body-related issues.
     pub fn parse(&mut self, buf: &'buf [u8]) -> Result<usize, WireError> {
         match self.head.parse(buf) {
             Ok(httparse::Status::Complete(headers_len)) => self.parse_core(buf, headers_len),
@@ -175,7 +223,28 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
         }
     }
 
-    /// Parse using uninitialized headers (optimized, uses parse_with_uninit_headers).
+    /// Parse an HTTP request using uninitialized headers storage (performance optimization).
+    ///
+    /// This method avoids the overhead of initializing the headers array before parsing
+    /// by using [`httparse::Request::parse_with_uninit_headers`](httparse::Request::parse_with_uninit_headers).
+    /// It is particularly useful when parsing many requests with the same headers buffer.
+    ///
+    /// For the standard version using initialized headers, see [`parse`](Self::parse).
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP message bytes
+    /// * `headers` - A mutable slice of uninitialized `Header` structs to store parsed headers
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(total_len)` where `total_len` is the complete message length (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`WireError::PartialHead`] if headers are incomplete,
+    /// [`WireError::HttparseError`] if header parsing fails,
+    /// or errors from [`parse_core`](Self::parse_core) for body-related issues.
     pub fn parse_uninit(
         &mut self,
         buf: &'buf [u8],
