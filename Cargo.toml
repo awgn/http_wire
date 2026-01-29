@@ -1,6 +1,6 @@
 [package]
 name = "http_wire"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 authors = ["Nicola Bonelli <nicola@larthia.com>"]
 description = "Serialize HTTP/1.1 requests and responses to wire format bytes"

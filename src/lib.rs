@@ -1,63 +1,25 @@
 //! Serialize and parse HTTP/1.x requests and responses to/from wire format bytes.
 //!
 //! This crate provides encoding and decoding for HTTP/1.0 and HTTP/1.1 messages.
-//! HTTP/2 and HTTP/3 are not supported.
+//!
+//! # Implementation Details
+//!
+//! This crate leverages the [hyper](https://crates.io/crates/hyper) library for reliable
+//! and specification-compliant HTTP serialization.
+//!
+//! Because hyper is asynchronous, the synchronous encoding APIs provided by this crate
+//! internally create a temporary, single-threaded Tokio runtime to drive the serialization.
+//! If you are already operating within an async context, you should prefer the `_async`
+//! variants (e.g., [`WireEncodeAsync`]) to avoid the overhead of creating a nested runtime.
 //!
 //! # Encoding
 //!
 //! Use the [`WireEncode`] trait to convert HTTP messages to their wire format (synchronously):
 //!
-//! ```rust
-//! use http_wire::WireEncode;
-//! use http::Request;
-//! use http_body_util::Empty;
-//! use bytes::Bytes;
-//!
-//! let request = Request::builder()
-//!     .uri("/api/users")
-//!     .header("Host", "example.com")
-//!     .body(Empty::<Bytes>::new())
-//!     .unwrap();
-//!
-//! let bytes = request.encode().unwrap();
-//! ```
-//!
-//! For async encoding, use [`WireEncodeAsync`]:
-//!
-//! ```rust,no_run
-//! use http_wire::WireEncodeAsync;
-//! use http::Request;
-//! use http_body_util::Empty;
-//! use bytes::Bytes;
-//!
-//! # async fn example() {
-//! let request = Request::builder()
-//!     .uri("/api/users")
-//!     .header("Host", "example.com")
-//!     .body(Empty::<Bytes>::new())
-//!     .unwrap();
-//!
-//! let bytes = request.encode_async().await.unwrap();
-//! # }
-//! ```
-//!
-//! # Decoding
-//!
-//! Use the [`WireDecode`] trait to parse raw bytes and determine message boundaries:
-//!
-//! ```rust
-//! use http_wire::WireDecode;
-//! use http_wire::request::RequestLength;
-//!
-//! let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n";
-//!
-//! if let Some(length) = RequestLength::decode(raw) {
-//!     println!("Complete request: {} bytes", length);
-//! }
-//! ```
 
 use bytes::Bytes;
-use std::future::Future;
+pub use httparse::Header;
+use std::{future::Future, mem::MaybeUninit};
 
 mod error;
 pub mod request;
@@ -144,149 +106,115 @@ pub trait WireEncodeAsync {
     fn encode_async(self) -> impl Future<Output = Result<Bytes, WireError>> + Send;
 }
 
-/// Parse raw HTTP bytes to determine message boundaries.
+/// Decode HTTP messages from raw bytes.
 ///
-/// Implementations:
-/// - [`request::RequestLength`] - returns total message length
-/// - [`response::ResponseStatusCode`] - returns status code and length
-pub trait WireDecode: Sized {
-    /// The type returned by successful decoding.
-    type Output;
-
-    /// Attempts to decode the byte slice.
+/// This trait provides two methods for decoding:
+/// - `decode`: Uses initialized headers storage (works for all types)
+/// - `decode_uninit`: Uses uninitialized headers storage (optimization, only available for some types)
+///
+/// # Examples
+///
+/// ## Decoding a request (standard method)
+///
+/// ```rust
+/// use http_wire::WireDecode;
+/// use http_wire::request::FullRequest;
+///
+/// let raw = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+/// let mut headers = [httparse::EMPTY_HEADER; 16];
+/// let (request, total_len) = FullRequest::decode(raw, &mut headers).unwrap();
+///
+/// assert_eq!(request.head.method, Some("GET"));
+/// assert_eq!(request.head.path, Some("/api/users"));
+/// ```
+///
+/// ## Decoding a request (optimized method with uninitialized headers)
+///
+/// ```rust
+/// use http_wire::WireDecode;
+/// use http_wire::request::FullRequest;
+/// use std::mem::MaybeUninit;
+///
+/// let raw = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
+/// let mut headers = [const { MaybeUninit::uninit() }; 16];
+/// let (request, total_len) = FullRequest::decode_uninit(raw, &mut headers).unwrap();
+///
+/// assert_eq!(request.head.method, Some("GET"));
+/// ```
+///
+/// ## Decoding a response
+///
+/// ```rust
+/// use http_wire::WireDecode;
+/// use http_wire::response::FullResponse;
+///
+/// let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+/// let mut headers = [httparse::EMPTY_HEADER; 16];
+/// let (response, total_len) = FullResponse::decode(raw, &mut headers).unwrap();
+///
+/// assert_eq!(response.head.code, Some(200));
+/// assert_eq!(response.body, b"hello");
+/// ```
+///
+/// Note: `decode_uninit` is not available for `FullResponse` because the underlying
+/// `httparse::Response` parser does not support uninitialized headers.
+pub trait WireDecode<'headers, 'buf>: Sized {
+    /// Decode using initialized headers storage.
     ///
-    /// Returns `Some(Output)` if complete and valid, `None` otherwise.
-    fn decode(bytes: &[u8]) -> Option<Self::Output>;
-}
+    /// This method works for both requests and responses.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP message bytes
+    /// * `headers` - A mutable slice of initialized `Header` structs to store parsed headers
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok((Self, usize))` where `Self` is the decoded message and `usize` is the
+    /// total length of the message in bytes (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns `WireError` if:
+    /// - Headers are incomplete (`WireError::PartialHead`)
+    /// - Body is incomplete (`WireError::IncompleteBody`)
+    /// - Chunked encoding is malformed (`WireError::InvalidChunkedBody`)
+    fn decode(
+        buf: &'buf [u8],
+        headers: &'headers mut [Header<'buf>],
+    ) -> Result<(Self, usize), WireError>;
 
-// Implementation of WireEncode for Request
-impl<B> WireEncode for http::Request<B>
-where
-    B: http_body_util::BodyExt + Send + Sync + 'static,
-    B::Data: Send + Sync + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    fn encode(self) -> Result<Bytes, WireError> {
-        // Create a minimal single-threaded runtime
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| WireError::Connection(Box::new(e)))?;
-
-        // Block on the async encode method
-        rt.block_on(self.encode_async())
-    }
-}
-
-// Implementation of WireEncode for Response
-impl<B> WireEncode for http::Response<B>
-where
-    B: hyper::body::Body + Clone + Send + Sync + 'static,
-    B::Data: Send + Sync + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    fn encode(self) -> Result<Bytes, WireError> {
-        // Create a minimal single-threaded runtime
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| WireError::Connection(Box::new(e)))?;
-
-        // Block on the async encode method
-        rt.block_on(self.encode_async())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use http_body_util::{Empty, Full};
-
-    #[test]
-    fn test_request_sync_no_body() {
-        let request = http::Request::builder()
-            .method("GET")
-            .uri("/api/test")
-            .header("Host", "example.com")
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-
-        let bytes = request.encode().unwrap();
-        let output = String::from_utf8_lossy(&bytes);
-
-        assert!(output.contains("GET /api/test HTTP/1.1"));
-        assert!(output.contains("host: example.com"));
-    }
-
-    #[test]
-    fn test_request_sync_with_body() {
-        let body = r#"{"test":"data"}"#;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/api/submit")
-            .header("Host", "example.com")
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .unwrap();
-
-        let bytes = request.encode().unwrap();
-        let output = String::from_utf8_lossy(&bytes);
-
-        assert!(output.contains("POST /api/submit HTTP/1.1"));
-        assert!(output.contains(body));
-    }
-
-    #[test]
-    fn test_request_sync_http2_rejected() {
-        let request = http::Request::builder()
-            .method("GET")
-            .uri("/")
-            .version(http::Version::HTTP_2)
-            .body(Empty::<Bytes>::new())
-            .unwrap();
-
-        let result = request.encode();
-        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
-    }
-
-    #[test]
-    fn test_response_sync_ok() {
-        let response = http::Response::builder()
-            .status(200)
-            .header("Content-Type", "text/plain")
-            .body(Full::new(Bytes::from("Hello")))
-            .unwrap();
-
-        let bytes = response.encode().unwrap();
-        let output = String::from_utf8_lossy(&bytes);
-
-        assert!(output.contains("HTTP/1.1 200 OK"));
-        assert!(output.contains("Hello"));
-    }
-
-    #[test]
-    fn test_response_sync_404() {
-        let response = http::Response::builder()
-            .status(404)
-            .body(Full::new(Bytes::from("Not Found")))
-            .unwrap();
-
-        let bytes = response.encode().unwrap();
-        let output = String::from_utf8_lossy(&bytes);
-
-        assert!(output.contains("HTTP/1.1 404"));
-        assert!(output.contains("Not Found"));
-    }
-
-    #[test]
-    fn test_response_sync_http2_rejected() {
-        let response = http::Response::builder()
-            .status(200)
-            .version(http::Version::HTTP_2)
-            .body(Full::new(Bytes::from("Hello")))
-            .unwrap();
-
-        let result = response.encode();
-        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
+    /// Decode using uninitialized headers storage (performance optimization).
+    ///
+    /// This method avoids the overhead of initializing the headers array before parsing.
+    /// It is only available for types where the underlying parser supports
+    /// `parse_with_uninit_headers`. Currently only `FullRequest` implements this.
+    ///
+    /// # Arguments
+    ///
+    /// * `buf` - The buffer containing the raw HTTP message bytes
+    /// * `headers` - A mutable slice of uninitialized `Header` structs to store parsed headers
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok((Self, usize))` where `Self` is the decoded message and `usize` is the
+    /// total length of the message in bytes (headers + body).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as `decode`.
+    ///
+    /// # Panics
+    ///
+    /// The default implementation panics with an explanatory message for types that don't
+    /// support this optimization (e.g., `FullResponse`).
+    fn decode_uninit(
+        buf: &'buf [u8],
+        headers: &'headers mut [MaybeUninit<Header<'buf>>],
+    ) -> Result<(Self, usize), WireError> {
+        let _ = (buf, headers);
+        unimplemented!(
+            "decode_uninit is not available for this type due to missing parse_with_uninit_headers method in the underlying httparse parser"
+        )
     }
 }

@@ -1,4 +1,7 @@
-//! Error types for HTTP wire format operations.
+//! Error handling for HTTP wire operations.
+//!
+//! This module defines the [`WireError`] type, which encompasses all possible errors
+//! that can occur during encoding or decoding.
 
 /// Errors that can occur during HTTP wire format encoding.
 #[derive(Debug, thiserror::Error)]
@@ -7,7 +10,7 @@ pub enum WireError {
     ///
     /// This occurs when there's a failure during the HTTP handshake
     /// or while transmitting the message through the internal pipeline.
-    #[error("HTTP connection error: {0}")]
+    #[error("http connection error: {0}")]
     Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Internal synchronization error.
@@ -24,4 +27,16 @@ pub enum WireError {
     /// impractical for single messages.
     #[error("unsupported HTTP version: only HTTP/1.0 and HTTP/1.1 are supported")]
     UnsupportedVersion,
+
+    #[error("{0}")]
+    HttparseError(#[from] httparse::Error),
+
+    #[error("partial head")]
+    PartialHead,
+
+    #[error("partial body: {0} bytes missing")]
+    IncompleteBody(usize),
+
+    #[error("invalid chunked body")]
+    InvalidChunkedBody,
 }

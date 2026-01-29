@@ -40,7 +40,10 @@ fn synchronous_example() {
     match request.encode() {
         Ok(bytes) => {
             println!("✓ Encoded {} bytes synchronously", bytes.len());
-            println!("  First 50 chars: {:?}", &String::from_utf8_lossy(&bytes[..50.min(bytes.len())]));
+            println!(
+                "  First 50 chars: {:?}",
+                &String::from_utf8_lossy(&bytes[..50.min(bytes.len())])
+            );
         }
         Err(e) => eprintln!("✗ Error: {}", e),
     }
@@ -75,7 +78,10 @@ fn async_example() {
         match request.encode_async().await {
             Ok(bytes) => {
                 println!("✓ Encoded {} bytes asynchronously", bytes.len());
-                println!("  First 50 chars: {:?}", &String::from_utf8_lossy(&bytes[..50.min(bytes.len())]));
+                println!(
+                    "  First 50 chars: {:?}",
+                    &String::from_utf8_lossy(&bytes[..50.min(bytes.len())])
+                );
             }
             Err(e) => eprintln!("✗ Error: {}", e),
         }
@@ -96,7 +102,7 @@ mod tests {
     #[test]
     fn benchmark_sync_encoding() {
         let start = std::time::Instant::now();
-        
+
         for _ in 0..1000 {
             let request = Request::builder()
                 .method("GET")
@@ -115,7 +121,7 @@ mod tests {
     #[tokio::test]
     async fn benchmark_async_encoding() {
         let start = std::time::Instant::now();
-        
+
         for _ in 0..1000 {
             let request = Request::builder()
                 .method("GET")
