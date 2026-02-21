@@ -5,116 +5,86 @@
 //!
 //! # Request Encoding
 //!
-//! The [`WireEncode`] and [`WireEncodeAsync`] traits are implemented for [`http::Request`],
-//! allowing you to serialize requests to bytes.
+//! The [`WireEncode`] trait is implemented for [`http::Request`],
+//! allowing you to serialize requests to bytes via direct serialization
+//! (no async runtime or HTTP pipeline required).
 //!
 
-use bytes::Bytes;
-use http_body_util::Empty;
-use hyper_util::rt::TokioIo;
-use tokio::io::duplex;
-use tokio::sync::oneshot;
+use bytes::{Bytes, BytesMut};
+use std::borrow::Cow;
 
 pub use httparse::{Header, Request};
 
 use crate::error::WireError;
-use crate::util::{is_chunked_slice, parse_chunked_body, parse_usize};
-use crate::wire::WireCapture;
-use crate::{WireDecode, WireEncode, WireEncodeAsync};
+use crate::util::{chunked_body_len, is_chunked_slice, version_to_str};
+use crate::{WireDecode, WireEncode};
 use std::mem::MaybeUninit;
 
-// Implementation of WireEncode for Request
 impl<B> WireEncode for http::Request<B>
 where
-    B: http_body_util::BodyExt + Send + Sync + 'static,
-    B::Data: Send + Sync + 'static,
+    B: http_body_util::BodyExt,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     fn encode(self) -> Result<Bytes, WireError> {
-        // Create a minimal single-threaded runtime
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|e| WireError::Connection(Box::new(e)))?;
-
-        // Block on the async encode method
-        rt.block_on(self.encode_async())
-    }
-}
-
-impl<B> WireEncodeAsync for http::Request<B>
-where
-    B::Data: Send + Sync + 'static,
-    B: http_body_util::BodyExt + Send + Sync + 'static,
-    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
-{
-    #[inline]
-    async fn encode_async(self) -> Result<Bytes, WireError> {
-        use hyper::service::service_fn;
-        use std::convert::Infallible;
-
-        // Check HTTP version - only HTTP/1.1 and HTTP/1.0 are supported
         let version = self.version();
         if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
             return Err(WireError::UnsupportedVersion);
         }
 
-        let (client, server) = duplex(8192);
-        let capture_client = WireCapture::new(client);
-        let captured_ref = capture_client.captured.clone();
+        let (parts, body) = self.into_parts();
 
-        let (tx, rx) = oneshot::channel::<Result<(), WireError>>();
+        // Collect body bytes synchronously.
+        // Works for any body type whose future completes without an async I/O driver
+        let body_bytes = futures::executor::block_on(body.collect())
+            .map_err(|e| WireError::Collection(e.into()))?
+            .to_bytes();
 
-        // Spawn a mock server that will accept the connection and read the request
-        let server_handle = tokio::spawn(async move {
-            let tx = std::sync::Mutex::new(Some(tx));
-            let service = service_fn(move |_req: http::Request<hyper::body::Incoming>| {
-                // Signal that the request has been received
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(Ok(()));
-                }
-                async move {
-                    // Return a minimal response
-                    Ok::<_, Infallible>(http::Response::new(Empty::<Bytes>::new()))
-                }
-            });
+        // Determine the request target:
+        //   - absolute-form when a scheme is present (proxy requests)
+        //   - origin-form otherwise (standard /path?query)
+        let target: Cow<str> = if parts.uri.scheme().is_some() {
+            Cow::Owned(parts.uri.to_string())
+        } else {
+            Cow::Borrowed(
+                parts
+                    .uri
+                    .path_and_query()
+                    .map(|pq| pq.as_str())
+                    .unwrap_or("/"),
+            )
+        };
 
-            hyper::server::conn::http1::Builder::new()
-                .serve_connection(TokioIo::new(server), service)
-                .await
-        });
+        // Pre-allocate a rough estimate: 48 bytes per header covers name + value
+        // in the typical case; 16 bytes of fixed overhead absorbs the request line
+        // separators and the blank line. Both are intentionally coarse — the point
+        // is to avoid the most common reallocations, not to be exact.
+        let mut buf = BytesMut::with_capacity(
+            parts.headers.len() * 48 + body_bytes.len() + 16,
+        );
 
-        // Send the request through the client side and capture what's written
-        let client_handle = tokio::spawn(async move {
-            let client_connection = hyper::client::conn::http1::Builder::new()
-                .handshake(TokioIo::new(capture_client))
-                .await;
+        // Request line: METHOD SP request-target SP HTTP-version CRLF
+        buf.extend_from_slice(parts.method.as_str().as_bytes());
+        buf.extend_from_slice(b" ");
+        buf.extend_from_slice(target.as_bytes());
+        buf.extend_from_slice(b" ");
+        buf.extend_from_slice(version_to_str(version).as_bytes());
+        buf.extend_from_slice(b"\r\n");
 
-            match client_connection {
-                Ok((mut sender, connection)) => {
-                    // Spawn the connection driver
-                    tokio::spawn(connection);
+        // Header fields
+        for (name, value) in &parts.headers {
+            buf.extend_from_slice(name.as_str().as_bytes());
+            buf.extend_from_slice(b": ");
+            buf.extend_from_slice(value.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+        }
 
-                    // Send the request
-                    sender
-                        .send_request(self)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| WireError::Connection(Box::new(e)))
-                }
-                Err(e) => Err(WireError::Connection(Box::new(e))),
-            }
-        });
+        // Header/body separator
+        buf.extend_from_slice(b"\r\n");
 
-        // Wait for the server to receive the request
-        rx.await.map_err(|_| WireError::Sync)??;
+        // Body
+        buf.extend_from_slice(&body_bytes);
 
-        // Cleanup
-        client_handle.abort();
-        server_handle.abort();
-
-        let result = captured_ref.lock().clone();
-        Ok(Bytes::from(result))
+        Ok(buf.freeze())
     }
 }
 
@@ -168,7 +138,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
         for header in self.head.headers.iter() {
             let name = header.name.as_bytes();
             if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
-                content_len = parse_usize(header.value);
+                content_len = std::str::from_utf8(header.value).ok().and_then(|s| s.parse().ok());
             } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
                 is_chunked = is_chunked_slice(header.value);
             }
@@ -177,7 +147,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
         // Calculate body length
         if is_chunked {
             let body_len =
-                parse_chunked_body(&buf[headers_len..]).ok_or(WireError::InvalidChunkedBody)?;
+                chunked_body_len(&buf[headers_len..]).ok_or(WireError::InvalidChunkedBody)?;
             self.body = &buf[headers_len..headers_len + body_len];
             Ok(headers_len + body_len)
         } else {
@@ -289,10 +259,13 @@ impl<'headers, 'buf> WireDecode<'headers, 'buf> for FullRequest<'headers, 'buf> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use http_body_util::{Empty, Full};
 
+    // ── Encoding ────────────────────────────────────────────────────────────
+
     #[test]
-    fn test_request_sync_no_body() {
+    fn test_request_encode_no_body() {
         let request = http::Request::builder()
             .method("GET")
             .uri("/api/test")
@@ -305,10 +278,11 @@ mod tests {
 
         assert!(output.contains("GET /api/test HTTP/1.1"));
         assert!(output.contains("host: example.com"));
+        assert!(output.contains("\r\n\r\n"));
     }
 
     #[test]
-    fn test_request_sync_with_body() {
+    fn test_request_encode_with_body() {
         let body = r#"{"test":"data"}"#;
         let request = http::Request::builder()
             .method("POST")
@@ -322,11 +296,28 @@ mod tests {
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.contains("POST /api/submit HTTP/1.1"));
+        assert!(output.contains("host: example.com"));
+        assert!(output.contains("content-type: application/json"));
         assert!(output.contains(body));
     }
 
     #[test]
-    fn test_request_sync_http2_rejected() {
+    fn test_request_encode_http10() {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/")
+            .version(http::Version::HTTP_10)
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let bytes = request.encode().unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(output.starts_with("GET / HTTP/1.0\r\n"));
+    }
+
+    #[test]
+    fn test_request_encode_http2_rejected() {
         let request = http::Request::builder()
             .method("GET")
             .uri("/")
@@ -338,52 +329,59 @@ mod tests {
         assert!(matches!(result, Err(WireError::UnsupportedVersion)));
     }
 
-    #[tokio::test]
-    async fn test_request_to_wire() {
+    #[test]
+    fn test_request_encode_query_string() {
         let request = http::Request::builder()
             .method("GET")
-            .uri("/api/test")
+            .uri("/search?q=rust&limit=10")
             .header("Host", "example.com")
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let bytes = request.encode_async().await.unwrap();
+        let bytes = request.encode().unwrap();
         let output = String::from_utf8_lossy(&bytes);
 
-        assert!(output.contains("GET /api/test HTTP/1.1"));
-        assert!(output.contains("host: example.com"));
+        assert!(output.starts_with("GET /search?q=rust&limit=10 HTTP/1.1\r\n"));
     }
 
-    #[tokio::test]
-    async fn test_request_with_body_to_wire() {
-        let body = r#"{"test":"data"}"#;
-        let request = http::Request::builder()
-            .method("POST")
-            .uri("/api/submit")
-            .header("Host", "example.com")
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(body)))
-            .unwrap();
-
-        let bytes = request.encode_async().await.unwrap();
-        let output = String::from_utf8_lossy(&bytes);
-
-        assert!(output.contains("POST /api/submit HTTP/1.1"));
-        assert!(output.contains(body));
-    }
-
-    #[tokio::test]
-    async fn test_http2_request_rejected() {
+    #[test]
+    fn test_request_encode_header_body_separator() {
         let request = http::Request::builder()
             .method("GET")
             .uri("/")
-            .version(http::Version::HTTP_2)
             .body(Empty::<Bytes>::new())
             .unwrap();
 
-        let result = request.encode_async().await;
-        assert!(matches!(result, Err(WireError::UnsupportedVersion)));
+        let bytes = request.encode().unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        // Headers and body must be separated by exactly \r\n\r\n
+        assert!(output.contains("\r\n\r\n"));
+        let parts: Vec<&str> = output.splitn(2, "\r\n\r\n").collect();
+        assert_eq!(parts.len(), 2);
+        assert!(parts[1].is_empty()); // no body
     }
+
+    #[test]
+    fn test_request_encode_multiple_headers() {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("/api")
+            .header("Host", "example.com")
+            .header("Accept", "application/json")
+            .header("Authorization", "Bearer token123")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let bytes = request.encode().unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(output.contains("host: example.com"));
+        assert!(output.contains("accept: application/json"));
+        assert!(output.contains("authorization: Bearer token123"));
+    }
+
+    // ── Decoding ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_decode_request_no_body() {
@@ -446,13 +444,13 @@ mod tests {
 
     #[test]
     fn test_decode_request_extra_data_after() {
-        // Buffer has extra data after the request - should return correct length
+        // Buffer has extra data after the request — decode should return correct length
         let request = b"GET /api/users HTTP/1.1\r\nHost: example.com\r\n\r\n";
         let mut raw = request.to_vec();
         raw.extend_from_slice(b"extra garbage data");
         let mut headers = [httparse::EMPTY_HEADER; 16];
-        let result = FullRequest::decode(&raw, &mut headers);
-        assert!(result.is_ok());
+        let (_, len) = FullRequest::decode(&raw, &mut headers).unwrap();
+        assert_eq!(len, request.len());
     }
 
     #[test]

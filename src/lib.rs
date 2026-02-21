@@ -4,106 +4,88 @@
 //!
 //! # Implementation Details
 //!
-//! This crate leverages the [hyper](https://crates.io/crates/hyper) library for reliable
-//! and specification-compliant HTTP serialization.
+//! Encoding is performed via direct serialization: the request/response line,
+//! headers, and body are written sequentially into a `BytesMut` buffer.
+//! No async runtime or HTTP pipeline is required.
 //!
-//! Because hyper is asynchronous, the synchronous encoding APIs provided by this crate
-//! internally create a temporary, single-threaded Tokio runtime to drive the serialization.
-//! If you are already operating within an async context, you should prefer the `_async`
-//! variants (e.g., [`WireEncodeAsync`]) to avoid the overhead of creating a nested runtime.
+//! The body is collected synchronously using [`futures::executor::block_on`],
+//! which works without a Tokio runtime for any body type whose future completes
+//! without async I/O (e.g. [`http_body_util::Full`], [`http_body_util::Empty`]).
 //!
 //! # Encoding
 //!
-//! Use the [`WireEncode`] trait to convert HTTP messages to their wire format (synchronously):
+//! Use the [`WireEncode`] trait to convert HTTP messages to their wire format:
 //!
+//! ```rust
+//! use http_wire::WireEncode;
+//! use http::Request;
+//! use http_body_util::Full;
+//! use bytes::Bytes;
+//!
+//! let request = Request::builder()
+//!     .method("POST")
+//!     .uri("/api/users")
+//!     .header("Host", "example.com")
+//!     .header("Content-Type", "application/json")
+//!     .body(Full::new(Bytes::from(r#"{"name":"John"}"#)))
+//!     .unwrap();
+//!
+//! let bytes = request.encode().unwrap();
+//! ```
+//!
+//! # Decoding
+//!
+//! Use the [`WireDecode`] trait with [`request::FullRequest`] or
+//! [`response::FullResponse`] to parse raw bytes and determine message boundaries.
 
 use bytes::Bytes;
 pub use httparse::Header;
-use std::{future::Future, mem::MaybeUninit};
+use std::mem::MaybeUninit;
 
 mod error;
 pub mod request;
 pub mod response;
 mod util;
-mod wire;
 
 pub use error::WireError;
 
-/// Encode HTTP messages to their wire format bytes (synchronous version).
-///
-/// This trait provides synchronous encoding without requiring an async runtime.
-/// It creates a minimal single-threaded Tokio runtime internally and blocks on
-/// the async encoding method.
+/// Encode HTTP messages to their wire format bytes.
 ///
 /// Implemented for `http::Request<B>` and `http::Response<B>`.
 /// Only HTTP/1.0 and HTTP/1.1 are supported.
+///
+/// Encoding is performed by direct serialization into a pre-allocated buffer.
+/// The body is collected synchronously via [`futures::executor::block_on`],
+/// which requires no Tokio runtime for in-memory body types such as
+/// [`http_body_util::Full`] and [`http_body_util::Empty`].
 ///
 /// # Example
 ///
 /// ```rust
 /// use http_wire::WireEncode;
 /// use http::Request;
-/// use http_body_util::Full;
+/// use http_body_util::Empty;
 /// use bytes::Bytes;
 ///
 /// let request = Request::builder()
 ///     .method("GET")
 ///     .uri("/api/users")
 ///     .header("Host", "example.com")
-///     .body(Full::new(Bytes::from("hello")))
+///     .body(Empty::<Bytes>::new())
 ///     .unwrap();
 ///
 /// let bytes = request.encode().unwrap();
 /// ```
-///
-/// For async encoding, use [`WireEncodeAsync`] instead.
 pub trait WireEncode {
-    /// Encodes the HTTP message to wire format bytes synchronously.
-    ///
-    /// This method creates a minimal single-threaded Tokio runtime and blocks
-    /// until the encoding is complete.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`WireError::UnsupportedVersion`] for HTTP/2 or later.
-    fn encode(self) -> Result<Bytes, WireError>
-    where
-        Self: Sized;
-}
-
-/// Encode HTTP messages to their wire format bytes (async version).
-///
-/// Implemented for `http::Request<B>` and `http::Response<B>`.
-/// Only HTTP/1.0 and HTTP/1.1 are supported.
-///
-/// For synchronous encoding without requiring an async runtime,
-/// use [`WireEncode`] instead.
-///
-/// # Example
-///
-/// ```rust,no_run
-/// use http_wire::WireEncodeAsync;
-/// use http::Request;
-/// use http_body_util::Empty;
-/// use bytes::Bytes;
-///
-/// # async fn example() {
-/// let request = Request::builder()
-///     .uri("/api/users")
-///     .header("Host", "example.com")
-///     .body(Empty::<Bytes>::new())
-///     .unwrap();
-///
-/// let bytes = request.encode_async().await.unwrap();
-/// # }
-/// ```
-pub trait WireEncodeAsync {
     /// Encodes the HTTP message to wire format bytes.
     ///
     /// # Errors
     ///
     /// Returns [`WireError::UnsupportedVersion`] for HTTP/2 or later.
-    fn encode_async(self) -> impl Future<Output = Result<Bytes, WireError>> + Send;
+    /// Returns [`WireError::Connection`] if body collection fails.
+    fn encode(self) -> Result<Bytes, WireError>
+    where
+        Self: Sized;
 }
 
 /// Decode HTTP messages from raw bytes.

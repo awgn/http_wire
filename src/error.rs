@@ -3,22 +3,15 @@
 //! This module defines the [`WireError`] type, which encompasses all possible errors
 //! that can occur during encoding or decoding.
 
-/// Errors that can occur during HTTP wire format encoding.
+/// Errors that can occur during HTTP wire format encoding or decoding.
 #[derive(Debug, thiserror::Error)]
 pub enum WireError {
-    /// HTTP connection error during the encoding process.
+    /// Body collection error during the encoding process.
     ///
-    /// This occurs when there's a failure during the HTTP handshake
-    /// or while transmitting the message through the internal pipeline.
-    #[error("http connection error: {0}")]
-    Connection(#[source] Box<dyn std::error::Error + Send + Sync>),
-
-    /// Internal synchronization error.
-    ///
-    /// This occurs when an internal communication channel closes unexpectedly.
-    /// If you encounter this error, please report it as a bug.
-    #[error("synchronization error: channel closed unexpectedly")]
-    Sync,
+    /// This occurs when the body future returns an error while being
+    /// collected synchronously prior to serialization.
+    #[error("body collection error: {0}")]
+    Collection(#[source] Box<dyn std::error::Error + Send + Sync>),
 
     /// Unsupported HTTP version.
     ///

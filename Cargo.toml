@@ -1,23 +1,19 @@
 [package]
 name = "http_wire"
-version = "0.5.1"
+version = "0.7.0"
 edition = "2024"
 authors = ["Nicola Bonelli <nicola@larthia.com>"]
-description = "Serialize HTTP/1.1 requests and responses to wire format bytes"
+description = "Serialize HTTP requests and responses to wire format bytes"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/awgn/http_wire"
 readme = "README.md"
-keywords = ["http", "http1", "serialization", "wire-format", "hyper"]
+keywords = ["http", "http1", "serialization", "wire-format", "bytes"]
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
-bytes = "1.11.0"
-futures = "0.3.31"
+bytes = "1.11.1"
+futures = { version = "0.3.32", default-features = false, features = ["executor"] }
 http = "1.4.0"
 http-body-util = "0.1.3"
 httparse = "1.10.1"
-hyper = { version = "1.8.1", features = ["client", "http1", "server"] }
-hyper-util = { version = "0.1.19", features = ["tokio"] }
-parking_lot = "0.12.5"
-thiserror = "2.0.17"
-tokio = { version = "1.49.0", features = ["io-std", "io-util", "macros", "rt", "time"] }
+thiserror = "2.0.18"
