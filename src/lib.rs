@@ -39,6 +39,7 @@
 //! [`response::FullResponse`] to parse raw bytes and determine message boundaries.
 
 use bytes::Bytes;
+#[doc(no_inline)]
 pub use httparse::Header;
 use std::mem::MaybeUninit;
 

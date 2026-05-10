@@ -25,6 +25,7 @@
 
 use bytes::{Bytes, BytesMut};
 
+#[doc(no_inline)]
 pub use httparse::{Header, Response};
 
 use crate::error::WireError;

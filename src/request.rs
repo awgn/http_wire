@@ -13,6 +13,7 @@
 use bytes::{Bytes, BytesMut};
 use std::borrow::Cow;
 
+#[doc(no_inline)]
 pub use httparse::{Header, Request};
 
 use crate::error::WireError;
