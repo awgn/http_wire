@@ -11,14 +11,14 @@
 //!
 
 use bytes::{Bytes, BytesMut};
-use std::borrow::Cow;
 
 #[doc(no_inline)]
 pub use httparse::{Header, Request};
 
 use crate::error::WireError;
 use crate::util::{
-    chunked_body_len, extend_headers, is_chunked_slice, parse_dec_usize, version_to_str,
+    chunked_body_len, extend_headers, extend_uri, is_chunked_slice, parse_dec_usize, uri_len,
+    version_to_str,
 };
 use crate::{WireDecode, WireEncode};
 use std::mem::MaybeUninit;
@@ -43,33 +43,18 @@ where
             .map_err(|e| WireError::Collection(e.into()))?
             .to_bytes();
 
-        // Determine the request target:
-        //   - absolute-form when a scheme is present (proxy requests)
-        //   - origin-form otherwise (standard /path?query)
-        let target: Cow<str> = if parts.uri.scheme().is_some() {
-            Cow::Owned(parts.uri.to_string())
-        } else {
-            Cow::Borrowed(
-                parts
-                    .uri
-                    .path_and_query()
-                    .map(|pq| pq.as_str())
-                    .unwrap_or("/"),
-            )
-        };
-
         // Pre-allocate a rough estimate: 48 bytes per header covers name + value
         // in the typical case; 16 bytes of fixed overhead absorbs the request line
         // separators and the blank line. Both are intentionally coarse — the point
         // is to avoid the most common reallocations, not to be exact.
         let mut buf = BytesMut::with_capacity(
-            parts.headers.len() * 48 + body_bytes.len() + 16,
+            parts.headers.len() * 48 + body_bytes.len() + uri_len(&parts.uri) + 16,
         );
 
         // Request line: METHOD SP request-target SP HTTP-version CRLF
         buf.extend_from_slice(parts.method.as_str().as_bytes());
         buf.extend_from_slice(b" ");
-        buf.extend_from_slice(target.as_bytes());
+        extend_uri(&mut buf, &parts.uri);
         buf.extend_from_slice(b" ");
         buf.extend_from_slice(version_to_str(version).as_bytes());
         buf.extend_from_slice(b"\r\n");
@@ -346,6 +331,21 @@ mod tests {
         let output = String::from_utf8_lossy(&bytes);
 
         assert!(output.starts_with("GET /search?q=rust&limit=10 HTTP/1.1\r\n"));
+    }
+
+    #[test]
+    fn test_request_encode_absolute_uri_proxy() {
+        let request = http::Request::builder()
+            .method("GET")
+            .uri("http://proxy.example.com:8080/path?key=value")
+            .header("Host", "proxy.example.com")
+            .body(Empty::<Bytes>::new())
+            .unwrap();
+
+        let bytes = request.encode().unwrap();
+        let output = String::from_utf8_lossy(&bytes);
+
+        assert!(output.starts_with("GET http://proxy.example.com:8080/path?key=value HTTP/1.1\r\n"));
     }
 
     #[test]

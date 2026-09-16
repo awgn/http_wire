@@ -157,6 +157,46 @@ pub(crate) fn extend_headers(buf: &mut BytesMut, headers: &http::HeaderMap) {
     }
 }
 
+/// Appends the request-target for `uri` directly to `buf` without heap allocations.
+///
+/// Handles:
+/// - absolute-form when a scheme is present (e.g. proxy requests: `http://example.com/path?query`)
+/// - origin-form otherwise (standard `/path?query`, defaulting to `/`)
+#[inline]
+pub(crate) fn extend_uri(buf: &mut BytesMut, uri: &http::Uri) {
+    if let Some(scheme) = uri.scheme_str() {
+        buf.extend_from_slice(scheme.as_bytes());
+        buf.extend_from_slice(b":");
+        if let Some(auth) = uri.authority() {
+            buf.extend_from_slice(b"//");
+            buf.extend_from_slice(auth.as_str().as_bytes());
+        }
+        if let Some(pq) = uri.path_and_query() {
+            buf.extend_from_slice(pq.as_str().as_bytes());
+        }
+    } else {
+        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+        buf.extend_from_slice(path.as_bytes());
+    }
+}
+
+/// Returns the byte length of the serialized request-target for `uri`.
+#[inline]
+pub(crate) fn uri_len(uri: &http::Uri) -> usize {
+    if let Some(scheme) = uri.scheme_str() {
+        let mut len = scheme.len() + 1; // "scheme:"
+        if let Some(auth) = uri.authority() {
+            len += 2 + auth.as_str().len(); // "//authority"
+        }
+        if let Some(pq) = uri.path_and_query() {
+            len += pq.as_str().len();
+        }
+        len
+    } else {
+        uri.path_and_query().map(|pq| pq.as_str().len()).unwrap_or(1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +440,45 @@ mod tests {
         let s = std::str::from_utf8(&buf).unwrap();
         assert!(s.contains("host: example.com\r\n"));
         assert!(s.contains("accept: */*\r\n"));
+    }
+
+    // ── extend_uri / uri_len direct unit tests ───────────────────────────────
+
+    #[test]
+    fn test_extend_uri_absolute() {
+        let uri: http::Uri = "http://example.com:8080/path?q=1".parse().unwrap();
+        let mut buf = BytesMut::new();
+        extend_uri(&mut buf, &uri);
+        assert_eq!(&buf[..], b"http://example.com:8080/path?q=1");
+        assert_eq!(buf.len(), uri_len(&uri));
+        assert_eq!(&buf[..], uri.to_string().as_bytes());
+    }
+
+    #[test]
+    fn test_extend_uri_origin() {
+        let uri: http::Uri = "/path?q=1".parse().unwrap();
+        let mut buf = BytesMut::new();
+        extend_uri(&mut buf, &uri);
+        assert_eq!(&buf[..], b"/path?q=1");
+        assert_eq!(buf.len(), uri_len(&uri));
+    }
+
+    #[test]
+    fn test_extend_uri_empty_defaults_to_slash() {
+        let uri = http::Uri::default();
+        let mut buf = BytesMut::new();
+        extend_uri(&mut buf, &uri);
+        assert_eq!(&buf[..], b"/");
+        assert_eq!(buf.len(), uri_len(&uri));
+    }
+
+    #[test]
+    fn test_extend_uri_scheme_and_authority_canonicalized() {
+        let uri: http::Uri = "http://example.com".parse().unwrap();
+        let mut buf = BytesMut::new();
+        extend_uri(&mut buf, &uri);
+        assert_eq!(&buf[..], b"http://example.com/");
+        assert_eq!(buf.len(), uri_len(&uri));
+        assert_eq!(&buf[..], uri.to_string().as_bytes());
     }
 }
