@@ -191,6 +191,7 @@ pub trait WireDecode<'headers, 'buf>: Sized {
     ///
     /// The default implementation panics with an explanatory message for types that don't
     /// support this optimization (e.g., `FullResponse`).
+    #[inline]
     fn decode_uninit(
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],

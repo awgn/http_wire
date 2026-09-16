@@ -28,6 +28,7 @@ where
     B: http_body_util::BodyExt,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    #[inline]
     fn encode(self) -> Result<Bytes, WireError> {
         let version = self.version();
         if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
@@ -128,6 +129,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
     ///
     /// Returns [`WireError::InvalidChunkedBody`] if chunked encoding is malformed,
     /// or [`WireError::IncompleteBody`] if the body is shorter than specified by `Content-Length`.
+    #[inline]
     fn parse_core(&mut self, buf: &'buf [u8], headers_len: usize) -> Result<usize, WireError> {
         let mut content_len: Option<usize> = None;
         let mut is_chunked = false;
@@ -183,6 +185,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
     /// Returns [`WireError::PartialHead`] if headers are incomplete,
     /// [`WireError::HttparseError`] if header parsing fails,
     /// or errors from [`parse_core`](Self::parse_core) for body-related issues.
+    #[inline]
     pub fn parse(&mut self, buf: &'buf [u8]) -> Result<usize, WireError> {
         match self.head.parse(buf) {
             Ok(httparse::Status::Complete(headers_len)) => self.parse_core(buf, headers_len),
@@ -213,6 +216,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
     /// Returns [`WireError::PartialHead`] if headers are incomplete,
     /// [`WireError::HttparseError`] if header parsing fails,
     /// or errors from [`parse_core`](Self::parse_core) for body-related issues.
+    #[inline]
     pub fn parse_uninit(
         &mut self,
         buf: &'buf [u8],
@@ -227,6 +231,7 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
 }
 
 impl<'headers, 'buf> WireDecode<'headers, 'buf> for FullRequest<'headers, 'buf> {
+    #[inline]
     fn decode(
         buf: &'buf [u8],
         headers: &'headers mut [Header<'buf>],
@@ -240,6 +245,7 @@ impl<'headers, 'buf> WireDecode<'headers, 'buf> for FullRequest<'headers, 'buf> 
         Ok((full_request, total))
     }
 
+    #[inline]
     fn decode_uninit(
         buf: &'buf [u8],
         headers: &'headers mut [MaybeUninit<Header<'buf>>],

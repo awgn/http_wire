@@ -39,6 +39,7 @@ where
     B: http_body_util::BodyExt,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    #[inline]
     fn encode(self) -> Result<Bytes, WireError> {
         let version = self.version();
         if version != http::Version::HTTP_11 && version != http::Version::HTTP_10 {
@@ -142,6 +143,7 @@ impl<'headers, 'buf> FullResponse<'headers, 'buf> {
     /// [`WireError::HttparseError`] if header parsing fails,
     /// [`WireError::InvalidChunkedBody`] if chunked encoding is malformed,
     /// or [`WireError::IncompleteBody`] if the body is shorter than specified by `Content-Length`.
+    #[inline]
     pub fn parse(&mut self, buf: &'buf [u8]) -> Result<usize, WireError> {
         match self.head.parse(buf) {
             Ok(httparse::Status::Complete(headers_len)) => {
@@ -191,6 +193,7 @@ impl<'headers, 'buf> FullResponse<'headers, 'buf> {
 }
 
 impl<'headers, 'buf> WireDecode<'headers, 'buf> for FullResponse<'headers, 'buf> {
+    #[inline]
     fn decode(
         buf: &'buf [u8],
         headers: &'headers mut [Header<'buf>],
