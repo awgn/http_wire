@@ -69,6 +69,31 @@ pub(crate) fn parse_dec_usize(slice: &[u8]) -> Option<usize> {
     Some(val)
 }
 
+/// Finds the index of the first occurrence of `\r\n` in `slice`.
+///
+/// Uses SIMD single-byte search for `\r` (via `memchr`)
+/// followed by checking whether the next byte is `\n`.
+#[inline]
+pub(crate) fn find_crlf(slice: &[u8]) -> Option<usize> {
+    let mut offset = 0;
+    while let Some(rel) = memchr::memchr(b'\r', &slice[offset..]) {
+        let idx = offset + rel;
+        if slice.get(idx + 1) == Some(&b'\n') {
+            return Some(idx);
+        }
+        offset = idx + 1;
+    }
+    None
+}
+
+/// Finds the index of the first occurrence of `\r\n\r\n` in `slice`.
+///
+/// Uses SIMD multi-byte substring search (via `memchr::memmem::find`).
+#[inline]
+pub(crate) fn find_crlf_crlf(slice: &[u8]) -> Option<usize> {
+    memchr::memmem::find(slice, b"\r\n\r\n")
+}
+
 /// Returns the total length of the chunked body (including the final `0\r\n\r\n`).
 ///
 /// Returns `None` if the data is incomplete or malformed.
@@ -77,8 +102,8 @@ pub(crate) fn chunked_body_len(buf: &[u8]) -> Option<usize> {
     let mut pos = 0;
 
     loop {
-        // Find the CRLF that terminates the chunk-size line.
-        let crlf = buf[pos..].windows(2).position(|w| w == b"\r\n")?;
+        // Find the CRLF that terminates the chunk-size line via SIMD search.
+        let crlf = find_crlf(&buf[pos..])?;
 
         // The bytes before the CRLF are the chunk-size plus optional extensions.
         // Discard extensions and parse directly as hex.
@@ -88,13 +113,10 @@ pub(crate) fn chunked_body_len(buf: &[u8]) -> Option<usize> {
         pos += crlf + 2;
 
         if chunk_size == 0 {
-            // Terminal chunk: find the \r\n\r\n that closes the trailer section.
+            // Terminal chunk: find the \r\n\r\n that closes the trailer section via SIMD search.
             // Searching from pos-2 (the CRLF of the "0\r\n" line) means the pattern
             // matches immediately when there are no trailers, unifying both cases.
-            return buf[pos - 2..]
-                .windows(4)
-                .position(|w| w == b"\r\n\r\n")
-                .map(|k| pos - 2 + k + 4);
+            return find_crlf_crlf(&buf[pos - 2..]).map(|k| pos - 2 + k + 4);
         }
 
         // Advance past chunk data and its trailing CRLF.
@@ -319,5 +341,26 @@ mod tests {
         assert_eq!(parse_dec_usize(b"+10"), None);
         assert_eq!(parse_dec_usize(b"-10"), None);
         assert_eq!(parse_dec_usize(b"9999999999999999999999999999999999999999"), None);
+    }
+
+    // ── find_crlf / find_crlf_crlf direct unit tests ──────────────────────────
+
+    #[test]
+    fn test_find_crlf_direct() {
+        assert_eq!(find_crlf(b"abc\r\ndef"), Some(3));
+        assert_eq!(find_crlf(b"\r\ndef"), Some(0));
+        assert_eq!(find_crlf(b"\r\r\n"), Some(1));
+        assert_eq!(find_crlf(b"abc\rdef"), None);
+        assert_eq!(find_crlf(b"abc\ndef"), None);
+        assert_eq!(find_crlf(b""), None);
+    }
+
+    #[test]
+    fn test_find_crlf_crlf_direct() {
+        assert_eq!(find_crlf_crlf(b"header\r\n\r\nbody"), Some(6));
+        assert_eq!(find_crlf_crlf(b"\r\n\r\nbody"), Some(0));
+        assert_eq!(find_crlf_crlf(b"\r\n\rbody"), None);
+        assert_eq!(find_crlf_crlf(b"header\r\nbody\r\n"), None);
+        assert_eq!(find_crlf_crlf(b""), None);
     }
 }
