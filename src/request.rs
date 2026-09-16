@@ -17,7 +17,9 @@ use std::borrow::Cow;
 pub use httparse::{Header, Request};
 
 use crate::error::WireError;
-use crate::util::{chunked_body_len, is_chunked_slice, parse_dec_usize, version_to_str};
+use crate::util::{
+    chunked_body_len, extend_headers, is_chunked_slice, parse_dec_usize, version_to_str,
+};
 use crate::{WireDecode, WireEncode};
 use std::mem::MaybeUninit;
 
@@ -72,12 +74,7 @@ where
         buf.extend_from_slice(b"\r\n");
 
         // Header fields
-        for (name, value) in &parts.headers {
-            buf.extend_from_slice(name.as_str().as_bytes());
-            buf.extend_from_slice(b": ");
-            buf.extend_from_slice(value.as_bytes());
-            buf.extend_from_slice(b"\r\n");
-        }
+        extend_headers(&mut buf, &parts.headers);
 
         // Header/body separator
         buf.extend_from_slice(b"\r\n");

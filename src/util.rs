@@ -1,3 +1,5 @@
+use bytes::BytesMut;
+
 /// Converts an `http::Version` to its wire-format string.
 ///
 /// # Panics
@@ -132,13 +134,28 @@ pub(crate) fn chunked_body_len(buf: &[u8]) -> Option<usize> {
 /// Handles comma-separated lists (e.g. `gzip, chunked`) by checking only the
 /// **last** coding, as required by RFC 9112 §7.1. The comparison is
 /// case-insensitive and tolerates surrounding whitespace on each token.
-
 #[inline]
 pub(crate) fn is_chunked_slice(buf: &[u8]) -> bool {
     let last = buf.rsplit(|&b| b == b',').next().unwrap_or(buf);
     last.trim_ascii().eq_ignore_ascii_case(b"chunked")
 }
 
+/// Appends a single HTTP header field (`name: value\r\n`) to `buf`.
+#[inline]
+pub(crate) fn extend_header(buf: &mut BytesMut, name: &[u8], value: &[u8]) {
+    buf.extend_from_slice(name);
+    buf.extend_from_slice(b": ");
+    buf.extend_from_slice(value);
+    buf.extend_from_slice(b"\r\n");
+}
+
+/// Appends all HTTP headers in `headers` to `buf`.
+#[inline]
+pub(crate) fn extend_headers(buf: &mut BytesMut, headers: &http::HeaderMap) {
+    for (name, value) in headers {
+        extend_header(buf, name.as_str().as_bytes(), value.as_bytes());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -362,5 +379,26 @@ mod tests {
         assert_eq!(find_crlf_crlf(b"\r\n\rbody"), None);
         assert_eq!(find_crlf_crlf(b"header\r\nbody\r\n"), None);
         assert_eq!(find_crlf_crlf(b""), None);
+    }
+
+    // ── extend_header / extend_headers direct unit tests ─────────────────────
+
+    #[test]
+    fn test_extend_header_direct() {
+        let mut buf = BytesMut::new();
+        extend_header(&mut buf, b"Content-Type", b"text/plain");
+        assert_eq!(&buf[..], b"Content-Type: text/plain\r\n");
+    }
+
+    #[test]
+    fn test_extend_headers_direct() {
+        let mut map = http::HeaderMap::new();
+        map.insert("Host", "example.com".parse().unwrap());
+        map.insert("Accept", "*/*".parse().unwrap());
+        let mut buf = BytesMut::new();
+        extend_headers(&mut buf, &map);
+        let s = std::str::from_utf8(&buf).unwrap();
+        assert!(s.contains("host: example.com\r\n"));
+        assert!(s.contains("accept: */*\r\n"));
     }
 }
