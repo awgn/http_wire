@@ -29,7 +29,7 @@ use bytes::{Bytes, BytesMut};
 pub use httparse::{Header, Response};
 
 use crate::error::WireError;
-use crate::util::{chunked_body_len, is_chunked_slice, version_to_str};
+use crate::util::{chunked_body_len, is_chunked_slice, parse_dec_usize, version_to_str};
 use crate::{WireDecode, WireEncode};
 
 impl<B> WireEncode for http::Response<B>
@@ -163,9 +163,7 @@ impl<'headers, 'buf> FullResponse<'headers, 'buf> {
                 for header in self.head.headers.iter() {
                     let name = header.name.as_bytes();
                     if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
-                        content_len = std::str::from_utf8(header.value)
-                            .ok()
-                            .and_then(|s| s.parse().ok());
+                        content_len = parse_dec_usize(header.value);
                     } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
                         is_chunked = is_chunked_slice(header.value);
                     }
@@ -220,7 +218,7 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::{Empty, Full};
 
-    // ── Encoding ────────────────────────────────────────────────────────────
+    // ── Encoding ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_response_encode_200() {
@@ -335,7 +333,7 @@ mod tests {
         assert!(output.contains("cache-control: no-cache\r\n"));
     }
 
-    // ── Decoding ─────────────────────────────────────────────────────────────
+    // ── Decoding ──────────────────────────────────────────────────────────────
 
     #[test]
     fn test_decode_response_no_body() {

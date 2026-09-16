@@ -45,6 +45,30 @@ pub(crate) fn parse_chunk_size(mut slice: &[u8]) -> Option<usize> {
     Some(val)
 }
 
+/// Parses a decimal `usize` from a byte slice (e.g. for `Content-Length`).
+///
+/// Strips surrounding ASCII whitespace and parses decimal digits directly from ASCII bytes
+/// without UTF-8 validation.
+///
+/// Returns `None` if the slice is empty, contains non-digit bytes, or overflows `usize`.
+#[inline]
+pub(crate) fn parse_dec_usize(slice: &[u8]) -> Option<usize> {
+    let slice = slice.trim_ascii();
+    if slice.is_empty() {
+        return None;
+    }
+
+    let mut val: usize = 0;
+    for &b in slice {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+
+    Some(val)
+}
+
 /// Returns the total length of the chunked body (including the final `0\r\n\r\n`).
 ///
 /// Returns `None` if the data is incomplete or malformed.
@@ -280,5 +304,20 @@ mod tests {
         assert_eq!(parse_chunk_size(b"+10"), None);
         assert_eq!(parse_chunk_size(b"-10"), None);
         assert_eq!(parse_chunk_size(b"ffffffffffffffffffffffff"), None);
+    }
+
+    // ── parse_dec_usize direct unit tests ─────────────────────────────────────
+
+    #[test]
+    fn test_parse_dec_usize_direct() {
+        assert_eq!(parse_dec_usize(b"0"), Some(0));
+        assert_eq!(parse_dec_usize(b"42"), Some(42));
+        assert_eq!(parse_dec_usize(b"  100 \t"), Some(100));
+        assert_eq!(parse_dec_usize(b""), None);
+        assert_eq!(parse_dec_usize(b"   "), None);
+        assert_eq!(parse_dec_usize(b"12a3"), None);
+        assert_eq!(parse_dec_usize(b"+10"), None);
+        assert_eq!(parse_dec_usize(b"-10"), None);
+        assert_eq!(parse_dec_usize(b"9999999999999999999999999999999999999999"), None);
     }
 }
