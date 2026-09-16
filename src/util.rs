@@ -13,7 +13,37 @@ pub(crate) fn version_to_str(version: http::Version) -> &'static str {
     }
 }
 
+/// Parses the chunk-size field from a chunk header line.
+///
+/// Discards optional chunk extensions (starting with `;`), strips surrounding ASCII whitespace,
+/// and parses the hexadecimal value directly from ASCII bytes without UTF-8 validation.
+///
+/// Returns `None` if the field is empty, contains invalid hex digits, or overflows `usize`.
+#[inline]
+pub(crate) fn parse_chunk_size(mut slice: &[u8]) -> Option<usize> {
+    // Discard chunk extensions (anything from ';' onwards)
+    if let Some(semi_pos) = slice.iter().position(|&b| b == b';') {
+        slice = &slice[..semi_pos];
+    }
 
+    slice = slice.trim_ascii();
+    if slice.is_empty() {
+        return None;
+    }
+
+    let mut val: usize = 0;
+    for &b in slice {
+        let digit = match b {
+            b'0'..=b'9' => (b - b'0') as usize,
+            b'a'..=b'f' => (b - b'a' + 10) as usize,
+            b'A'..=b'F' => (b - b'A' + 10) as usize,
+            _ => return None,
+        };
+        val = val.checked_mul(16)?.checked_add(digit)?;
+    }
+
+    Some(val)
+}
 
 /// Returns the total length of the chunked body (including the final `0\r\n\r\n`).
 ///
@@ -27,13 +57,8 @@ pub(crate) fn chunked_body_len(buf: &[u8]) -> Option<usize> {
         let crlf = buf[pos..].windows(2).position(|w| w == b"\r\n")?;
 
         // The bytes before the CRLF are the chunk-size plus optional extensions.
-        // Split on ';' to discard extensions, then parse as hex.
-        let size_field = buf[pos..pos + crlf].splitn(2, |&b| b == b';').next()?;
-        let chunk_size = usize::from_str_radix(
-            std::str::from_utf8(size_field.trim_ascii()).ok()?,
-            16,
-        )
-        .ok()?;
+        // Discard extensions and parse directly as hex.
+        let chunk_size = parse_chunk_size(&buf[pos..pos + crlf])?;
 
         // Advance past the chunk-size line (including its CRLF).
         pos += crlf + 2;
@@ -148,7 +173,7 @@ mod tests {
         assert_eq!(chunked_body_len(buf), Some(buf.len()));
     }
 
-    // ── Incomplete data → must return None ───────────────────────────────────
+    // ── Incomplete data → must return None ────────────────────────────────────
 
     #[test]
     fn incomplete_chunk_data() {
@@ -183,7 +208,7 @@ mod tests {
         assert_eq!(chunked_body_len(b""), None);
     }
 
-    // ── Malformed input → must return None ───────────────────────────────────
+    // ── Malformed input → must return None ────────────────────────────────────
 
     #[test]
     fn invalid_hex_in_chunk_size() {
@@ -236,5 +261,24 @@ mod tests {
         // must overflow and return None.
         let hex = format!("{:x}\r\n", usize::MAX);
         assert_eq!(chunked_body_len(hex.as_bytes()), None);
+    }
+
+    // ── parse_chunk_size direct unit tests ───────────────────────────────────
+
+    #[test]
+    fn test_parse_chunk_size_direct() {
+        assert_eq!(parse_chunk_size(b"0"), Some(0));
+        assert_eq!(parse_chunk_size(b"1a"), Some(26));
+        assert_eq!(parse_chunk_size(b"1A"), Some(26));
+        assert_eq!(parse_chunk_size(b" 20 \t"), Some(32));
+        assert_eq!(parse_chunk_size(b"10;foo=bar"), Some(16));
+        assert_eq!(parse_chunk_size(b"10;"), Some(16));
+        assert_eq!(parse_chunk_size(b""), None);
+        assert_eq!(parse_chunk_size(b"   "), None);
+        assert_eq!(parse_chunk_size(b";ext"), None);
+        assert_eq!(parse_chunk_size(b"1g"), None);
+        assert_eq!(parse_chunk_size(b"+10"), None);
+        assert_eq!(parse_chunk_size(b"-10"), None);
+        assert_eq!(parse_chunk_size(b"ffffffffffffffffffffffff"), None);
     }
 }
