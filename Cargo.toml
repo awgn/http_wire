@@ -11,10 +11,17 @@ keywords = ["http", "http1", "serialization", "wire-format", "bytes"]
 categories = ["network-programming", "web-programming"]
 
 [dependencies]
-bytes = "1.11.1"
-futures = { version = "0.3.32", default-features = false, features = ["executor"] }
-http = "1.4.0"
-http-body-util = "0.1.3"
+bytes = "1.12.1"
+futures = { version = "0.3.34", default-features = false, features = ["executor"] }
+http = "1.5.0"
+http-body-util = "0.1.5"
 httparse = "1.10.1"
 memchr = "2"
-thiserror = "2.0.18"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+http-body = "1"
+
+[[bench]]
+name = "wire"
+harness = false

@@ -17,7 +17,7 @@ pub use httparse::{Header, Request};
 
 use crate::error::WireError;
 use crate::util::{
-    chunked_body_len, extend_headers, extend_uri, is_chunked_slice, parse_dec_usize, uri_len,
+    body_prealloc, drain_body, extend_headers, extend_uri, frame_body, headers_wire_len, uri_len,
     version_to_str,
 };
 use crate::{WireDecode, WireEncode};
@@ -37,22 +37,21 @@ where
 
         let (parts, body) = self.into_parts();
 
-        // Collect body bytes synchronously.
-        // Works for any body type whose future completes without an async I/O driver
-        let body_bytes = futures::executor::block_on(body.collect())
-            .map_err(|e| WireError::Collection(e.into()))?
-            .to_bytes();
-
-        // Pre-allocate a rough estimate: 48 bytes per header covers name + value
-        // in the typical case; 16 bytes of fixed overhead absorbs the request line
-        // separators and the blank line. Both are intentionally coarse — the point
-        // is to avoid the most common reallocations, not to be exact.
+        // Exact head size: "METHOD SP target SP HTTP/1.x CRLF" + headers + blank line.
+        // The body capacity comes from the (clamped) size hint, which is exact for
+        // in-memory bodies, so the common case never reallocates.
+        let method = parts.method.as_str();
         let mut buf = BytesMut::with_capacity(
-            parts.headers.len() * 48 + body_bytes.len() + uri_len(&parts.uri) + 16,
+            method.len()
+                + uri_len(&parts.uri)
+                + 12 // " " + " HTTP/1.x" + CRLF
+                + headers_wire_len(&parts.headers)
+                + 2
+                + body_prealloc(&body),
         );
 
         // Request line: METHOD SP request-target SP HTTP-version CRLF
-        buf.extend_from_slice(parts.method.as_str().as_bytes());
+        buf.extend_from_slice(method.as_bytes());
         buf.extend_from_slice(b" ");
         extend_uri(&mut buf, &parts.uri);
         buf.extend_from_slice(b" ");
@@ -65,8 +64,10 @@ where
         // Header/body separator
         buf.extend_from_slice(b"\r\n");
 
-        // Body
-        buf.extend_from_slice(&body_bytes);
+        // Body: data frames are appended straight into the output buffer.
+        // Works for any body type whose frames are ready without an async I/O driver
+        // (falls back to a blocking executor otherwise).
+        drain_body(body, &mut buf)?;
 
         Ok(buf.freeze())
     }
@@ -116,36 +117,8 @@ impl<'headers, 'buf> FullRequest<'headers, 'buf> {
     /// or [`WireError::IncompleteBody`] if the body is shorter than specified by `Content-Length`.
     #[inline]
     fn parse_core(&mut self, buf: &'buf [u8], headers_len: usize) -> Result<usize, WireError> {
-        let mut content_len: Option<usize> = None;
-        let mut is_chunked = false;
-
-        // Scan headers for Content-Length or Transfer-Encoding
-        for header in self.head.headers.iter() {
-            let name = header.name.as_bytes();
-            if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
-                content_len = parse_dec_usize(header.value);
-            } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
-                is_chunked = is_chunked_slice(header.value);
-            }
-        }
-
-        // Calculate body length
-        if is_chunked {
-            let body_len =
-                chunked_body_len(&buf[headers_len..]).ok_or(WireError::InvalidChunkedBody)?;
-            self.body = &buf[headers_len..headers_len + body_len];
-            Ok(headers_len + body_len)
-        } else {
-            // If content-length is missing, length is 0
-            let body_len = content_len.unwrap_or(0);
-            let total = headers_len + body_len;
-            if buf.len() >= total {
-                self.body = &buf[headers_len..total];
-                Ok(total)
-            } else {
-                Err(WireError::IncompleteBody(total - buf.len()))
-            }
-        }
+        self.body = frame_body(self.head.headers, buf, headers_len)?;
+        Ok(headers_len + self.body.len())
     }
 
     /// Parse an HTTP request using initialized headers storage.

@@ -30,7 +30,7 @@ pub use httparse::{Header, Response};
 
 use crate::error::WireError;
 use crate::util::{
-    chunked_body_len, extend_headers, is_chunked_slice, parse_dec_usize, version_to_str,
+    body_prealloc, drain_body, extend_headers, frame_body, headers_wire_len, version_to_str,
 };
 use crate::{WireDecode, WireEncode};
 
@@ -50,19 +50,14 @@ where
         let status = parts.status;
         let reason = status.canonical_reason().unwrap_or("Unknown");
 
-        // Collect body bytes synchronously.
-        // Works for any body type whose future completes without an async I/O driver
-        // (e.g. `Full<Bytes>`, `Empty<Bytes>`).
-        let body_bytes = futures::executor::block_on(body.collect())
-            .map_err(|e| WireError::Collection(e.into()))?
-            .to_bytes();
-
-        // Pre-allocate a rough estimate: 48 bytes per header covers name + value
-        // in the typical case; 16 bytes of fixed overhead absorbs the status line,
-        // separators and the blank line. Both are intentionally coarse — the point
-        // is to avoid the most common reallocations, not to be exact.
+        // Exact head size: "HTTP/1.x SP NNN SP reason CRLF" + headers + blank line.
+        // The body capacity comes from the (clamped) size hint, which is exact for
+        // in-memory bodies, so the common case never reallocates.
         let mut buf = BytesMut::with_capacity(
-            parts.headers.len() * 48 + body_bytes.len() + 16,
+            8 + 1 + 3 + 1 + reason.len() + 2
+                + headers_wire_len(&parts.headers)
+                + 2
+                + body_prealloc(&body),
         );
 
         // Status line: HTTP-version SP status-code SP reason-phrase CRLF
@@ -79,8 +74,10 @@ where
         // Header/body separator
         buf.extend_from_slice(b"\r\n");
 
-        // Body
-        buf.extend_from_slice(&body_bytes);
+        // Body: data frames are appended straight into the output buffer.
+        // Works for any body type whose frames are ready without an async I/O driver
+        // (falls back to a blocking executor otherwise).
+        drain_body(body, &mut buf)?;
 
         Ok(buf.freeze())
     }
@@ -155,36 +152,8 @@ impl<'headers, 'buf> FullResponse<'headers, 'buf> {
                     return Ok(headers_len);
                 }
 
-                let mut content_len: Option<usize> = None;
-                let mut is_chunked = false;
-
-                // Scan headers for Content-Length or Transfer-Encoding
-                for header in self.head.headers.iter() {
-                    let name = header.name.as_bytes();
-                    if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
-                        content_len = parse_dec_usize(header.value);
-                    } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
-                        is_chunked = is_chunked_slice(header.value);
-                    }
-                }
-
-                // Calculate body length
-                if is_chunked {
-                    let body_len = chunked_body_len(&buf[headers_len..])
-                        .ok_or(WireError::InvalidChunkedBody)?;
-                    self.body = &buf[headers_len..headers_len + body_len];
-                    Ok(headers_len + body_len)
-                } else {
-                    // If content-length is missing, length is 0
-                    let body_len = content_len.unwrap_or(0);
-                    let total = headers_len + body_len;
-                    if buf.len() >= total {
-                        self.body = &buf[headers_len..total];
-                        Ok(total)
-                    } else {
-                        Err(WireError::IncompleteBody(total - buf.len()))
-                    }
-                }
+                self.body = frame_body(self.head.headers, buf, headers_len)?;
+                Ok(headers_len + self.body.len())
             }
             Ok(httparse::Status::Partial) => Err(WireError::PartialHead),
             Err(err) => Err(err.into()),
