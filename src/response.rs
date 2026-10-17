@@ -23,14 +23,15 @@
 //!
 //! Use [`FullResponse`] to decode HTTP responses from raw bytes.
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 #[doc(no_inline)]
 pub use httparse::{Header, Response};
 
 use crate::error::WireError;
 use crate::util::{
-    body_prealloc, drain_body, extend_headers, frame_body, headers_wire_len, version_to_str,
+    FastBufWriter, body_prealloc, drain_body, frame_body, headers_wire_len, version_to_str,
+    write_headers_unchecked,
 };
 use crate::{WireDecode, WireEncode};
 
@@ -53,33 +54,37 @@ where
         // Exact head size: "HTTP/1.x SP NNN SP reason CRLF" + headers + blank line.
         // The body capacity comes from the (clamped) size hint, which is exact for
         // in-memory bodies, so the common case never reallocates.
-        let mut buf = BytesMut::with_capacity(
-            8 + 1 + 3 + 1 + reason.len() + 2
-                + headers_wire_len(&parts.headers)
-                + 2
-                + body_prealloc(&body),
-        );
+        let head_len = 8 + 1 + 3 + 1 + reason.len() + 2 + headers_wire_len(&parts.headers) + 2;
+        let mut buf = Vec::with_capacity(head_len + body_prealloc(&body));
 
-        // Status line: HTTP-version SP status-code SP reason-phrase CRLF
-        buf.extend_from_slice(version_to_str(version).as_bytes());
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(status.as_str().as_bytes());
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(reason.as_bytes());
-        buf.extend_from_slice(b"\r\n");
+        // SAFETY: `buf` was allocated with at least `head_len` bytes of capacity, and the
+        // sequence of writes below writes exactly `head_len` bytes before `set_len(head_len)`.
+        unsafe {
+            let mut w = FastBufWriter::new(&mut buf);
 
-        // Header fields
-        extend_headers(&mut buf, &parts.headers);
+            // Status line: HTTP-version SP status-code SP reason-phrase CRLF
+            w.put(version_to_str(version).as_bytes());
+            w.put_byte(b' ');
+            w.put(status.as_str().as_bytes());
+            w.put_byte(b' ');
+            w.put(reason.as_bytes());
+            w.put_crlf();
 
-        // Header/body separator
-        buf.extend_from_slice(b"\r\n");
+            // Header fields
+            write_headers_unchecked(&mut w, &parts.headers);
+
+            // Header/body separator
+            w.put_crlf();
+
+            buf.set_len(head_len);
+        }
 
         // Body: data frames are appended straight into the output buffer.
         // Works for any body type whose frames are ready without an async I/O driver
         // (falls back to a blocking executor otherwise).
         drain_body(body, &mut buf)?;
 
-        Ok(buf.freeze())
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -187,7 +192,7 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::{Empty, Full};
 
-    // ── Encoding ──────────────────────────────────────────────────────────────
+    // ── Encoding ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_response_encode_200() {
@@ -302,7 +307,7 @@ mod tests {
         assert!(output.contains("cache-control: no-cache\r\n"));
     }
 
-    // ── Decoding ──────────────────────────────────────────────────────────────
+    // ── Decoding ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_decode_response_no_body() {

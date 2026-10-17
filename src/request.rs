@@ -10,15 +10,15 @@
 //! (no async runtime or HTTP pipeline required).
 //!
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 
 #[doc(no_inline)]
 pub use httparse::{Header, Request};
 
 use crate::error::WireError;
 use crate::util::{
-    body_prealloc, drain_body, extend_headers, extend_uri, frame_body, headers_wire_len, uri_len,
-    version_to_str,
+    FastBufWriter, body_prealloc, drain_body, frame_body, headers_wire_len, uri_len,
+    version_to_str, write_headers_unchecked, write_uri_unchecked,
 };
 use crate::{WireDecode, WireEncode};
 use std::mem::MaybeUninit;
@@ -41,35 +41,42 @@ where
         // The body capacity comes from the (clamped) size hint, which is exact for
         // in-memory bodies, so the common case never reallocates.
         let method = parts.method.as_str();
-        let mut buf = BytesMut::with_capacity(
-            method.len()
-                + uri_len(&parts.uri)
-                + 12 // " " + " HTTP/1.x" + CRLF
-                + headers_wire_len(&parts.headers)
-                + 2
-                + body_prealloc(&body),
-        );
+        let head_len = method.len()
+            + uri_len(&parts.uri)
+            + 12 // " " + " HTTP/1.x" + CRLF
+            + headers_wire_len(&parts.headers)
+            + 2; // blank line CRLF
 
-        // Request line: METHOD SP request-target SP HTTP-version CRLF
-        buf.extend_from_slice(method.as_bytes());
-        buf.extend_from_slice(b" ");
-        extend_uri(&mut buf, &parts.uri);
-        buf.extend_from_slice(b" ");
-        buf.extend_from_slice(version_to_str(version).as_bytes());
-        buf.extend_from_slice(b"\r\n");
+        let mut buf = Vec::with_capacity(head_len + body_prealloc(&body));
 
-        // Header fields
-        extend_headers(&mut buf, &parts.headers);
+        // SAFETY: `buf` was allocated with at least `head_len` bytes of capacity, and the
+        // sequence of writes below writes exactly `head_len` bytes before `set_len(head_len)`.
+        unsafe {
+            let mut w = FastBufWriter::new(&mut buf);
 
-        // Header/body separator
-        buf.extend_from_slice(b"\r\n");
+            // Request line: METHOD SP request-target SP HTTP-version CRLF
+            w.put(method.as_bytes());
+            w.put_byte(b' ');
+            write_uri_unchecked(&mut w, &parts.uri);
+            w.put_byte(b' ');
+            w.put(version_to_str(version).as_bytes());
+            w.put_crlf();
+
+            // Header fields
+            write_headers_unchecked(&mut w, &parts.headers);
+
+            // Header/body separator
+            w.put_crlf();
+
+            buf.set_len(head_len);
+        }
 
         // Body: data frames are appended straight into the output buffer.
         // Works for any body type whose frames are ready without an async I/O driver
         // (falls back to a blocking executor otherwise).
         drain_body(body, &mut buf)?;
 
-        Ok(buf.freeze())
+        Ok(Bytes::from(buf))
     }
 }
 
@@ -224,7 +231,7 @@ mod tests {
     use bytes::Bytes;
     use http_body_util::{Empty, Full};
 
-    // ── Encoding ──────────────────────────────────────────────────────────────
+    // ── Encoding ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_request_encode_no_body() {
@@ -358,7 +365,7 @@ mod tests {
         assert!(output.contains("authorization: Bearer token123"));
     }
 
-    // ── Decoding ──────────────────────────────────────────────────────────────
+    // ── Decoding ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_decode_request_no_body() {

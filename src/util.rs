@@ -1,6 +1,7 @@
-use bytes::{BufMut, BytesMut};
+use bytes::Buf;
 use http_body_util::BodyExt;
 use std::pin::{Pin, pin};
+use std::ptr;
 use std::task::{Context, Poll, Waker};
 
 use crate::error::WireError;
@@ -10,16 +11,80 @@ use crate::error::WireError;
 /// The hint comes from user-supplied bodies and must not be trusted blindly.
 const MAX_BODY_PREALLOC: usize = 16 * 1024 * 1024;
 
+/// Unchecked cursor writer into a pre-allocated `Vec<u8>`.
+///
+/// # Safety invariant
+///
+/// Callers must ensure that the total number of bytes written via [`put`](Self::put)
+/// and [`put_byte`](Self::put_byte) never exceeds the reserved spare capacity of the
+/// underlying `Vec<u8>`.
+pub(crate) struct FastBufWriter {
+    ptr: *mut u8,
+}
+
+impl FastBufWriter {
+    /// Creates a new writer starting at the beginning of `buf`'s allocation.
+    #[inline(always)]
+    pub(crate) fn new(buf: &mut Vec<u8>) -> Self {
+        Self {
+            ptr: buf.as_mut_ptr(),
+        }
+    }
+
+    /// Copies `src` to the current cursor position and advances the cursor.
+    ///
+    /// # Safety
+    ///
+    /// There must be at least `src.len()` bytes of remaining capacity in the buffer.
+    #[inline(always)]
+    pub(crate) unsafe fn put(&mut self, src: &[u8]) {
+        let len = src.len();
+        unsafe {
+            ptr::copy_nonoverlapping(src.as_ptr(), self.ptr, len);
+            self.ptr = self.ptr.add(len);
+        }
+    }
+
+    /// Writes a single byte at the current cursor position and advances the cursor.
+    ///
+    /// # Safety
+    ///
+    /// There must be at least 1 byte of remaining capacity in the buffer.
+    #[inline(always)]
+    pub(crate) unsafe fn put_byte(&mut self, b: u8) {
+        unsafe {
+            *self.ptr = b;
+            self.ptr = self.ptr.add(1);
+        }
+    }
+
+    /// Writes the 2-byte sequence `\r\n` at the current cursor position.
+    ///
+    /// # Safety
+    ///
+    /// There must be at least 2 bytes of remaining capacity in the buffer.
+    #[inline(always)]
+    pub(crate) unsafe fn put_crlf(&mut self) {
+        unsafe {
+            ptr::copy_nonoverlapping(b"\r\n".as_ptr(), self.ptr, 2);
+            self.ptr = self.ptr.add(2);
+        }
+    }
+}
+
 /// Returns the number of body bytes worth reserving up front.
-#[inline]
+#[inline(always)]
 pub(crate) fn body_prealloc<B: BodyExt>(body: &B) -> usize {
+    if body.is_end_stream() {
+        return 0;
+    }
     usize::try_from(body.size_hint().lower())
         .unwrap_or(usize::MAX)
         .min(MAX_BODY_PREALLOC)
 }
 
 /// Exact serialized length of all header fields (`name: value\r\n` each).
-#[inline]
+#[inline(always)]
 pub(crate) fn headers_wire_len(headers: &http::HeaderMap) -> usize {
     headers
         .iter()
@@ -29,15 +94,19 @@ pub(crate) fn headers_wire_len(headers: &http::HeaderMap) -> usize {
 
 /// Appends every data frame of `body` to `buf`, ignoring trailers.
 ///
-/// Fast path: the body is polled once with a no-op waker. In-memory bodies
+/// Fast path: if `body.is_end_stream()` is true (e.g. `Empty`), returns immediately.
+/// Otherwise, the body is polled once with a no-op waker. In-memory bodies
 /// (`Full`, `Empty`, ...) are always ready, so no executor machinery is needed.
 /// If the body ever returns `Pending`, we fall back to `futures::executor::block_on`.
-#[inline]
-pub(crate) fn drain_body<B>(body: B, buf: &mut BytesMut) -> Result<(), WireError>
+#[inline(always)]
+pub(crate) fn drain_body<B>(body: B, buf: &mut Vec<u8>) -> Result<(), WireError>
 where
     B: BodyExt,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    if body.is_end_stream() {
+        return Ok(());
+    }
     let mut body = pin!(body);
     let mut cx = Context::from_waker(Waker::noop());
     match poll_all(body.as_mut(), &mut cx, buf) {
@@ -48,7 +117,7 @@ where
 
 #[cold]
 #[inline(never)]
-fn drain_body_blocking<B>(mut body: Pin<&mut B>, buf: &mut BytesMut) -> Result<(), WireError>
+fn drain_body_blocking<B>(mut body: Pin<&mut B>, buf: &mut Vec<u8>) -> Result<(), WireError>
 where
     B: BodyExt,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -62,7 +131,7 @@ where
 fn poll_all<B>(
     mut body: Pin<&mut B>,
     cx: &mut Context<'_>,
-    buf: &mut BytesMut,
+    buf: &mut Vec<u8>,
 ) -> Poll<Result<(), WireError>>
 where
     B: BodyExt,
@@ -71,8 +140,13 @@ where
     loop {
         match body.as_mut().poll_frame(cx) {
             Poll::Ready(Some(Ok(frame))) => {
-                if let Ok(data) = frame.into_data() {
-                    buf.put(data);
+                if let Ok(mut data) = frame.into_data() {
+                    while data.has_remaining() {
+                        let chunk = data.chunk();
+                        buf.extend_from_slice(chunk);
+                        let n = chunk.len();
+                        data.advance(n);
+                    }
                 }
             }
             Poll::Ready(Some(Err(e))) => return Poll::Ready(Err(WireError::Collection(e.into()))),
@@ -82,10 +156,44 @@ where
     }
 }
 
+/// Fast SWAR case-insensitive comparison against `"content-length"` (14 bytes).
+///
+/// The caller must guarantee `name.len() == 14`.
+#[inline(always)]
+fn eq_content_length_14(name: &[u8]) -> bool {
+    debug_assert_eq!(name.len(), 14);
+    // SAFETY: `name.len() == 14`, so reading 8 bytes at offset 0 and 8 bytes at offset 6 is valid.
+    unsafe {
+        let w0 = ptr::read_unaligned(name.as_ptr() as *const u64) | 0x2020_2020_2020_2020;
+        let w1 = ptr::read_unaligned(name.as_ptr().add(6) as *const u64) | 0x2020_2020_2020_2020;
+        let t0 = u64::from_ne_bytes(*b"content-");
+        let t1 = u64::from_ne_bytes(*b"t-length");
+        (w0 ^ t0) | (w1 ^ t1) == 0
+    }
+}
+
+/// Fast SWAR case-insensitive comparison against `"transfer-encoding"` (17 bytes).
+///
+/// The caller must guarantee `name.len() == 17`.
+#[inline(always)]
+fn eq_transfer_encoding_17(name: &[u8]) -> bool {
+    debug_assert_eq!(name.len(), 17);
+    // SAFETY: `name.len() == 17`, so reading 8 bytes at offset 0, 8 bytes at offset 8,
+    // and 1 byte at offset 16 is valid.
+    unsafe {
+        let w0 = ptr::read_unaligned(name.as_ptr() as *const u64) | 0x2020_2020_2020_2020;
+        let w1 = ptr::read_unaligned(name.as_ptr().add(8) as *const u64) | 0x2020_2020_2020_2020;
+        let b16 = (*name.get_unchecked(16)) | 0x20;
+        let t0 = u64::from_ne_bytes(*b"transfer");
+        let t1 = u64::from_ne_bytes(*b"-encodin");
+        ((w0 ^ t0) | (w1 ^ t1) == 0) & (b16 == b'g')
+    }
+}
+
 /// Determines the body slice of a message whose head (`headers_len` bytes) was already parsed.
 ///
 /// Looks at `Content-Length` / `Transfer-Encoding` and returns the body as a sub-slice of `buf`.
-#[inline]
+#[inline(always)]
 pub(crate) fn frame_body<'buf>(
     headers: &[httparse::Header<'_>],
     buf: &'buf [u8],
@@ -96,10 +204,14 @@ pub(crate) fn frame_body<'buf>(
 
     for header in headers {
         let name = header.name.as_bytes();
-        if name.len() == 14 && name.eq_ignore_ascii_case(b"Content-Length") {
-            content_len = parse_dec_usize(header.value);
-        } else if name.len() == 17 && name.eq_ignore_ascii_case(b"Transfer-Encoding") {
-            is_chunked = is_chunked_slice(header.value);
+        match name.len() {
+            14 if !is_chunked && eq_content_length_14(name) => {
+                content_len = parse_dec_usize(header.value);
+            }
+            17 if eq_transfer_encoding_17(name) => {
+                is_chunked = is_chunked_slice(header.value);
+            }
+            _ => {}
         }
     }
 
@@ -150,13 +262,11 @@ pub(crate) fn parse_chunk_size(mut slice: &[u8]) -> Option<usize> {
 
     let mut val: usize = 0;
     for &b in slice {
-        let digit = match b {
-            b'0'..=b'9' => (b - b'0') as usize,
-            b'a'..=b'f' => (b - b'a' + 10) as usize,
-            b'A'..=b'F' => (b - b'A' + 10) as usize,
-            _ => return None,
-        };
-        val = val.checked_mul(16)?.checked_add(digit)?;
+        let digit = hex_nibble(b);
+        if digit > 15 {
+            return None;
+        }
+        val = val.checked_mul(16)?.checked_add(digit as usize)?;
     }
 
     Some(val)
@@ -168,19 +278,35 @@ pub(crate) fn parse_chunk_size(mut slice: &[u8]) -> Option<usize> {
 /// without UTF-8 validation.
 ///
 /// Returns `None` if the slice is empty, contains non-digit bytes, or overflows `usize`.
-#[inline]
+#[inline(always)]
 pub(crate) fn parse_dec_usize(slice: &[u8]) -> Option<usize> {
     let slice = slice.trim_ascii();
-    if slice.is_empty() {
+    let len = slice.len();
+    if len == 0 {
         return None;
+    }
+
+    // Fast path for up to 19 digits on 64-bit targets: cannot overflow `u64`/`usize`.
+    #[cfg(target_pointer_width = "64")]
+    if len <= 19 {
+        let mut val: usize = 0;
+        for &b in slice {
+            let d = b.wrapping_sub(b'0');
+            if d > 9 {
+                return None;
+            }
+            val = val * 10 + d as usize;
+        }
+        return Some(val);
     }
 
     let mut val: usize = 0;
     for &b in slice {
-        if !b.is_ascii_digit() {
+        let d = b.wrapping_sub(b'0');
+        if d > 9 {
             return None;
         }
-        val = val.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+        val = val.checked_mul(10)?.checked_add(d as usize)?;
     }
 
     Some(val)
@@ -261,17 +387,34 @@ pub(crate) fn chunked_body_len(buf: &[u8]) -> Option<usize> {
 /// other shape (extensions, whitespace, overflow, missing CRLF, ...), in which case
 /// the caller must use the general path to get identical semantics.
 #[inline(always)]
+fn hex_nibble(b: u8) -> u8 {
+    let d = b.wrapping_sub(b'0');
+    if d <= 9 {
+        return d;
+    }
+    let a = (b | 0x20).wrapping_sub(b'a');
+    if a <= 5 {
+        return a + 10;
+    }
+    0xFF
+}
+
+#[inline(always)]
 fn chunk_line_fast(buf: &[u8]) -> Option<(usize, usize)> {
     let mut val: usize = 0;
+    let max_digits = (usize::BITS as usize) / 4;
     for (i, &b) in buf.iter().enumerate() {
-        let digit = match b {
-            b'0'..=b'9' => b - b'0',
-            b'a'..=b'f' => b - b'a' + 10,
-            b'A'..=b'F' => b - b'A' + 10,
-            b'\r' if i > 0 && buf.get(i + 1) == Some(&b'\n') => return Some((val, i + 2)),
-            _ => return None,
-        };
-        val = val.checked_mul(16)?.checked_add(digit as usize)?;
+        let digit = hex_nibble(b);
+        if digit <= 15 {
+            if i >= max_digits {
+                return None;
+            }
+            val = (val << 4) | (digit as usize);
+        } else if b == b'\r' && i > 0 && buf.get(i + 1) == Some(&b'\n') {
+            return Some((val, i + 2));
+        } else {
+            return None;
+        }
     }
     None
 }
@@ -281,8 +424,12 @@ fn chunk_line_fast(buf: &[u8]) -> Option<(usize, usize)> {
 /// Handles comma-separated lists (e.g. `gzip, chunked`) by checking only the
 /// **last** coding, as required by RFC 9112 §7.1. The comparison is
 /// case-insensitive and tolerates surrounding whitespace on each token.
-#[inline]
+#[inline(always)]
 pub(crate) fn is_chunked_slice(buf: &[u8]) -> bool {
+    // Fast path for the overwhelmingly common exact literal `b"chunked"` (7 bytes).
+    if buf.len() == 7 {
+        return buf.eq_ignore_ascii_case(b"chunked");
+    }
     let last = match memchr::memrchr(b',', buf) {
         Some(i) => &buf[i + 1..],
         None => buf,
@@ -290,48 +437,64 @@ pub(crate) fn is_chunked_slice(buf: &[u8]) -> bool {
     last.trim_ascii().eq_ignore_ascii_case(b"chunked")
 }
 
-/// Appends a single HTTP header field (`name: value\r\n`) to `buf`.
-#[inline]
-pub(crate) fn extend_header(buf: &mut BytesMut, name: &[u8], value: &[u8]) {
-    buf.extend_from_slice(name);
-    buf.extend_from_slice(b": ");
-    buf.extend_from_slice(value);
-    buf.extend_from_slice(b"\r\n");
-}
-
-/// Appends all HTTP headers in `headers` to `buf`.
-#[inline]
-pub(crate) fn extend_headers(buf: &mut BytesMut, headers: &http::HeaderMap) {
-    for (name, value) in headers {
-        extend_header(buf, name.as_str().as_bytes(), value.as_bytes());
+/// Appends a single HTTP header field (`name: value\r\n`) to `w`.
+///
+/// # Safety
+///
+/// `w` must have at least `name.len() + value.len() + 4` bytes of remaining capacity.
+#[inline(always)]
+pub(crate) unsafe fn write_header_unchecked(w: &mut FastBufWriter, name: &[u8], value: &[u8]) {
+    unsafe {
+        w.put(name);
+        ptr::copy_nonoverlapping(b": ".as_ptr(), w.ptr, 2);
+        w.ptr = w.ptr.add(2);
+        w.put(value);
+        w.put_crlf();
     }
 }
 
-/// Appends the request-target for `uri` directly to `buf` without heap allocations.
+/// Appends all HTTP headers in `headers` to `w`.
 ///
-/// Handles:
-/// - absolute-form when a scheme is present (e.g. proxy requests: `http://example.com/path?query`)
-/// - origin-form otherwise (standard `/path?query`, defaulting to `/`)
-#[inline]
-pub(crate) fn extend_uri(buf: &mut BytesMut, uri: &http::Uri) {
-    if let Some(scheme) = uri.scheme_str() {
-        buf.extend_from_slice(scheme.as_bytes());
-        buf.extend_from_slice(b":");
-        if let Some(auth) = uri.authority() {
-            buf.extend_from_slice(b"//");
-            buf.extend_from_slice(auth.as_str().as_bytes());
+/// # Safety
+///
+/// `w` must have at least `headers_wire_len(headers)` bytes of remaining capacity.
+#[inline(always)]
+pub(crate) unsafe fn write_headers_unchecked(w: &mut FastBufWriter, headers: &http::HeaderMap) {
+    for (name, value) in headers {
+        unsafe {
+            write_header_unchecked(w, name.as_str().as_bytes(), value.as_bytes());
         }
-        if let Some(pq) = uri.path_and_query() {
-            buf.extend_from_slice(pq.as_str().as_bytes());
+    }
+}
+
+/// Appends the request-target for `uri` directly to `w` without heap allocations.
+///
+/// # Safety
+///
+/// `w` must have at least `uri_len(uri)` bytes of remaining capacity.
+#[inline(always)]
+pub(crate) unsafe fn write_uri_unchecked(w: &mut FastBufWriter, uri: &http::Uri) {
+    unsafe {
+        if let Some(scheme) = uri.scheme_str() {
+            w.put(scheme.as_bytes());
+            w.put_byte(b':');
+            if let Some(auth) = uri.authority() {
+                ptr::copy_nonoverlapping(b"//".as_ptr(), w.ptr, 2);
+                w.ptr = w.ptr.add(2);
+                w.put(auth.as_str().as_bytes());
+            }
+            if let Some(pq) = uri.path_and_query() {
+                w.put(pq.as_str().as_bytes());
+            }
+        } else {
+            let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
+            w.put(path.as_bytes());
         }
-    } else {
-        let path = uri.path_and_query().map(|pq| pq.as_str()).unwrap_or("/");
-        buf.extend_from_slice(path.as_bytes());
     }
 }
 
 /// Returns the byte length of the serialized request-target for `uri`.
-#[inline]
+#[inline(always)]
 pub(crate) fn uri_len(uri: &http::Uri) -> usize {
     if let Some(scheme) = uri.scheme_str() {
         let mut len = scheme.len() + 1; // "scheme:"
@@ -350,8 +513,44 @@ pub(crate) fn uri_len(uri: &http::Uri) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::BytesMut;
 
-    // ── Happy path ────────────────────────────────────────────────────────────
+    /// Helper for tests that previously used `extend_header`.
+    fn extend_header(buf: &mut BytesMut, name: &[u8], value: &[u8]) {
+        let mut v = Vec::with_capacity(name.len() + value.len() + 4);
+        let mut w = FastBufWriter::new(&mut v);
+        unsafe {
+            write_header_unchecked(&mut w, name, value);
+            v.set_len(name.len() + value.len() + 4);
+        }
+        buf.extend_from_slice(&v);
+    }
+
+    /// Helper for tests that previously used `extend_headers`.
+    fn extend_headers(buf: &mut BytesMut, headers: &http::HeaderMap) {
+        let len = headers_wire_len(headers);
+        let mut v = Vec::with_capacity(len);
+        let mut w = FastBufWriter::new(&mut v);
+        unsafe {
+            write_headers_unchecked(&mut w, headers);
+            v.set_len(len);
+        }
+        buf.extend_from_slice(&v);
+    }
+
+    /// Helper for tests that previously used `extend_uri`.
+    fn extend_uri(buf: &mut BytesMut, uri: &http::Uri) {
+        let len = uri_len(uri);
+        let mut v = Vec::with_capacity(len);
+        let mut w = FastBufWriter::new(&mut v);
+        unsafe {
+            write_uri_unchecked(&mut w, uri);
+            v.set_len(len);
+        }
+        buf.extend_from_slice(&v);
+    }
+
+    // ── Happy path ───────────────────────────────────────────────────────────
 
     #[test]
     fn single_chunk() {
@@ -397,7 +596,7 @@ mod tests {
         assert_eq!(chunked_body_len(buf), Some(b"5\r\nhello\r\n0\r\n\r\n".len()));
     }
 
-    // ── Chunk extensions (after ';') ──────────────────────────────────────────
+    // ── Chunk extensions (after ';') ─────────────────────────────────────────
 
     #[test]
     fn chunk_extension_is_ignored() {
@@ -412,7 +611,7 @@ mod tests {
         assert_eq!(chunked_body_len(buf), Some(buf.len()));
     }
 
-    // ── Trailers ──────────────────────────────────────────────────────────────
+    // ── Trailers ─────────────────────────────────────────────────────────────
 
     #[test]
     fn single_trailer() {
@@ -426,7 +625,7 @@ mod tests {
         assert_eq!(chunked_body_len(buf), Some(buf.len()));
     }
 
-    // ── Incomplete data → must return None ────────────────────────────────────
+    // ── Incomplete data → must return None ───────────────────────────────────
 
     #[test]
     fn incomplete_chunk_data() {
@@ -461,7 +660,7 @@ mod tests {
         assert_eq!(chunked_body_len(b""), None);
     }
 
-    // ── Malformed input → must return None ────────────────────────────────────
+    // ── Malformed input → must return None ───────────────────────────────────
 
     #[test]
     fn invalid_hex_in_chunk_size() {
@@ -496,7 +695,7 @@ mod tests {
         assert_eq!(chunked_body_len(&full), None);
     }
 
-    // ── Overflow safety ───────────────────────────────────────────────────────
+    // ── Overflow safety ──────────────────────────────────────────────────────
 
     #[test]
     fn chunk_size_overflow_rejected() {
@@ -535,7 +734,7 @@ mod tests {
         assert_eq!(parse_chunk_size(b"ffffffffffffffffffffffff"), None);
     }
 
-    // ── parse_dec_usize direct unit tests ─────────────────────────────────────
+    // ── parse_dec_usize direct unit tests ────────────────────────────────────
 
     #[test]
     fn test_parse_dec_usize_direct() {
@@ -550,7 +749,7 @@ mod tests {
         assert_eq!(parse_dec_usize(b"9999999999999999999999999999999999999999"), None);
     }
 
-    // ── find_crlf / find_crlf_crlf direct unit tests ──────────────────────────
+    // ── find_crlf / find_crlf_crlf direct unit tests ─────────────────────────
 
     #[test]
     fn test_find_crlf_direct() {
